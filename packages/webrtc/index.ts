@@ -11,3 +11,9 @@ export {
   type BufferedDataChannelOptions,
   type DataChannelState,
 } from './data-channel';
+
+export {
+  WebRtcPeer,
+  type WebRtcPeerErrorContext,
+  type WebRtcPeerOptions,
+} from './peer';
