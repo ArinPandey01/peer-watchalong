@@ -1,1 +1,5 @@
 docs/temp.md
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
