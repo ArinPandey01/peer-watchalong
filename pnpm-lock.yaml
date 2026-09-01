@@ -19,6 +19,8 @@ importers:
 
   packages/protocol: {}
 
+  packages/tracker-client: {}
+
 packages:
 
   '@types/node@24.13.3':
