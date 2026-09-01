@@ -1,0 +1,12 @@
+{
+  "name": "peer-watchalong",
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "devDependencies": {
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.11"
+  }
+}
