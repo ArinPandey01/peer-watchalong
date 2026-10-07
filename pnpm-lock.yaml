@@ -19,6 +19,8 @@ importers:
 
   packages/protocol: {}
 
+  packages/webrtc: {}
+
 packages:
 
   '@types/node@24.13.3':
