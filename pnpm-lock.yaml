@@ -19,6 +19,8 @@ importers:
 
   packages/protocol: {}
 
+  packages/scheduler: {}
+
   packages/webrtc: {}
 
 packages:
