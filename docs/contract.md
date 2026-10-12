@@ -86,6 +86,10 @@ Tracker to viewer.
 }
 ```
 
+When the host disconnects, the tracker sends `ROOM_CLOSED_EVENT` to each
+remaining viewer with payload `{ reason: 'HOST_DISCONNECTED' }`. Viewers must
+stop using the closed room's peer identity and media connections.
+
 ## Topology
 
 ```ts
@@ -136,7 +140,8 @@ relayed messages, not request/response pairs, so they do not use `replyTo`.
 
 Error codes are `INVALID_MESSAGE`, `NOT_REGISTERED`,
 `SESSION_ALREADY_EXISTS`, `SESSION_NOT_FOUND`, `PEER_NOT_FOUND`,
-`NOT_NEIGHBOR`, `INVALID_CHUNK`, `SESSION_FULL`, and
+`NOT_HOST`, `NOT_NEIGHBOR`, `INVALID_CHUNK`, `INVALID_PLAYBACK_STATE`,
+`STALE_PLAYBACK_REVISION`, `SESSION_FULL`, and
 `PROTOCOL_VERSION_UNSUPPORTED`.
 
 ## DataChannel messages
