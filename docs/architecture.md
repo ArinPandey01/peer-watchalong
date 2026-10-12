@@ -188,11 +188,11 @@ The intended monorepo is divided by responsibility:
 ```text
 apps/
   tracker/    Control-plane service and authoritative swarm state
-  host/       Browser experience for the media owner
-  peer/       Browser experience for viewers
+  web/        Browser experience for hosts and viewers
 
 packages/
   protocol/   Shared contracts, serialization, parsing, and validation
+  tracker-client/  Browser WebSocket client for tracker control messages
   webrtc/     Thin RTCPeerConnection and RTCDataChannel wrappers
   scheduler/  Chunk demand, holder choice, retry, and prioritization
   buffer/     Chunk storage, MSE integration, and playback correction
