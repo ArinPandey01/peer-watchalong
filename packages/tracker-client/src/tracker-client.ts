@@ -17,14 +17,15 @@ import type {
   PlaybackStateReq,
   PlaybackStateRes,
   PlaybackUpdate,
+  RoomClosedEvent,
   SessionId,
   SignalIce,
   SignalSdp,
-} from '../../protocol/control';
+} from '../../protocol/control.ts';
 import {
   ControlValidationError,
   parseControlMessage,
-} from '../../protocol/control-validator';
+} from '../../protocol/control-validator.ts';
 
 const OPEN = 1;
 const CONNECTING = 0;
@@ -60,6 +61,7 @@ export interface TrackerCloseEvent {
 export interface TrackerClientEvents {
   open: undefined;
   close: TrackerCloseEvent;
+  roomClosed: RoomClosedEvent['payload'];
   topology: PeerTopology;
   playback: PlaybackState;
   signalSdp: SignalSdp;
@@ -91,17 +93,23 @@ export type ClockSyncSample = ClockSyncRes['payload'] & {
 };
 
 export class TrackerRequestError extends Error {
+  readonly code: ErrorMessage['payload']['code'];
+  readonly requestId?: string;
+
   constructor(
-    readonly code: ErrorMessage['payload']['code'],
+    code: ErrorMessage['payload']['code'],
     message: string,
-    readonly requestId?: string,
+    requestId?: string,
   ) {
     super(message);
     this.name = 'TrackerRequestError';
+    this.code = code;
+    this.requestId = requestId;
   }
 }
 
 export class TrackerClient {
+  readonly url: string;
   private readonly requestTimeoutMs: number;
   private readonly connectionTimeoutMs: number;
   private readonly createMessageId: () => string;
@@ -120,9 +128,10 @@ export class TrackerClient {
   private registrationInFlight = false;
 
   constructor(
-    readonly url: string,
+    url: string,
     options: TrackerClientOptions = {},
   ) {
+    this.url = url;
     this.requestTimeoutMs = options.requestTimeoutMs ?? 5_000;
     this.connectionTimeoutMs = options.connectionTimeoutMs ?? 10_000;
     this.createMessageId = options.createMessageId ?? defaultCreateMessageId;
@@ -147,40 +156,52 @@ export class TrackerClient {
     if (this.connected) return Promise.resolve();
     if (this.connectionPromise) return this.connectionPromise;
 
-    this.connectionPromise = new Promise<void>((resolve, reject) => {
-      let socket: WebSocketLike;
-      try {
-        socket = this.createWebSocket(this.url);
-      } catch (error) {
-        this.connectionPromise = null;
-        reject(asError(error));
-        return;
-      }
+    let socket: WebSocketLike;
+    try {
+      socket = this.createWebSocket(this.url);
+    } catch (error) {
+      return Promise.reject(asError(error));
+    }
 
-      this.socket = socket;
+    this.socket = socket;
+    const connectionPromise = new Promise<void>((resolve, reject) => {
+      let settled = false;
       const timeout = setTimeout(() => {
+        fail(new Error('Tracker connection timed out'));
         socket.close(1000, 'Connection timed out');
-        reject(new Error('Tracker connection timed out'));
       }, this.connectionTimeoutMs);
 
+      const fail = (error: Error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        if (this.socket === socket) this.connectionPromise = null;
+        reject(error);
+      };
+
       socket.onopen = () => {
+        if (settled || this.socket !== socket) return;
+        settled = true;
         clearTimeout(timeout);
         this.connectionPromise = null;
-        this.emit('open', undefined);
         resolve();
+        this.emit('open', undefined);
       };
       socket.onerror = () => {
-        if (socket.readyState === CONNECTING) {
-          clearTimeout(timeout);
-          this.connectionPromise = null;
-          reject(new Error('Unable to connect to tracker'));
+        if (!settled && socket.readyState === CONNECTING) {
+          fail(new Error('Unable to connect to tracker'));
+          socket.close();
         }
       };
-      socket.onmessage = (event) => this.receive(event.data);
+      socket.onmessage = (event) => {
+        if (this.socket === socket) this.receive(event.data);
+      };
       socket.onclose = (event) => {
         clearTimeout(timeout);
+        fail(new Error('Tracker connection closed before opening'));
+        if (this.socket !== socket) return;
         this.connectionPromise = null;
-        if (this.socket === socket) this.socket = null;
+        this.socket = null;
         this.clearIdentity();
         this.rejectPending(new Error('Tracker connection closed'));
         this.emit('close', {
@@ -191,6 +212,7 @@ export class TrackerClient {
       };
     });
 
+    this.connectionPromise = connectionPromise;
     return this.connectionPromise;
   }
 
@@ -362,6 +384,11 @@ export class TrackerClient {
     switch (message.type) {
       case 'TOPOLOGY_UPDATE_EVENT':
         this.emit('topology', message.payload.topology);
+        break;
+      case 'ROOM_CLOSED_EVENT':
+        this.clearIdentity();
+        this.rejectPending(new Error('Tracker room closed'));
+        this.emit('roomClosed', message.payload);
         break;
       case 'PLAYBACK_STATE_EVENT':
         this.emit('playback', message.payload.state);
