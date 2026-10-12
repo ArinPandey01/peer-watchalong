@@ -30,6 +30,10 @@ importers:
 
   packages/protocol: {}
 
+  packages/scheduler: {}
+
+  packages/webrtc: {}
+
 packages:
 
   '@esbuild/aix-ppc64@0.28.2':

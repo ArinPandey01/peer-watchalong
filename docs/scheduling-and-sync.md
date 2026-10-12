@@ -35,6 +35,11 @@ uploader.
 increases whenever the host seeks or changes the media. Play and pause update
 the playback state without changing the revision.
 
+When a viewer receives a higher revision, it seeks to the new target position
+even if the difference is less than the normal 2-second drift threshold. The
+viewer still waits for nearby chunks to be buffered before applying the seek.
+Small drift at the same revision uses playback-rate correction instead.
+
 Every chunk request records the revision it belongs to. For example, if a
 viewer is downloading chunks near 10:00 at revision 3 and the host seeks to
 25:00, the tracker publishes revision 4. The viewer then:

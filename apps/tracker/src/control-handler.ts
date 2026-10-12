@@ -7,19 +7,20 @@ import type {
   PeerId,
   PlaybackStateEvent,
   PlaybackStateRes,
+  RoomClosedEvent,
   SessionId,
   TopologyUpdateEvent,
-} from '../../../packages/protocol/control';
+} from '../../../packages/protocol/control.ts';
 import {
   ControlValidationError,
   parseControlMessage,
   validateControlMessage,
-} from '../../../packages/protocol/control-validator';
+} from '../../../packages/protocol/control-validator.ts';
 import {
   RoomRegistry,
   RoomRegistryError,
   type RoomRegistryErrorCode,
-} from './room-registry';
+} from './room-registry.ts';
 
 export type ConnectionId = string;
 
@@ -166,13 +167,20 @@ export class TrackerControlHandler {
     this.unbind(connectionId, binding.peerId);
 
     if (result.roomClosed) {
+      const notifications: OutboundControlMessage[] = [];
       for (const peerId of peerIdsBeforeRemoval) {
         const peerConnectionId = this.connectionsByPeer.get(peerId);
         if (peerConnectionId !== undefined) {
+          const event: RoomClosedEvent = {
+            ...this.messageBase('ROOM_CLOSED_EVENT', binding.sessionId),
+            type: 'ROOM_CLOSED_EVENT',
+            payload: { reason: 'HOST_DISCONNECTED' },
+          };
+          notifications.push(this.toConnection(peerConnectionId, event));
           this.unbind(peerConnectionId, peerId);
         }
       }
-      return [];
+      return notifications;
     }
 
     return this.topologyUpdates(binding.sessionId, result.affectedPeerIds);
@@ -434,12 +442,15 @@ type HandlerErrorCode =
   | 'INVALID_PLAYBACK_STATE';
 
 class HandlerError extends Error {
+  readonly code: HandlerErrorCode;
+
   constructor(
-    readonly code: HandlerErrorCode,
+    code: HandlerErrorCode,
     message: string,
   ) {
     super(message);
     this.name = 'HandlerError';
+    this.code = code;
   }
 }
 
