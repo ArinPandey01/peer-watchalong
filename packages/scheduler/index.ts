@@ -29,3 +29,13 @@ export {
   type HolderSelectionOptions,
   type PeerPerformance,
 } from './src/holder-selection.ts';
+
+export {
+  ChunkRequestScheduler,
+  DEFAULT_REQUEST_TIMEOUT_MS,
+  DEFAULT_QUERY_TIMEOUT_MS,
+  DEFAULT_INITIAL_QUERY_BACKOFF_MS,
+  DEFAULT_MAX_QUERY_BACKOFF_MS,
+  type ChunkRequestAction,
+  type ChunkRequestOptions,
+} from './src/chunk-requests.ts';

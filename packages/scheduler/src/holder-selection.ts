@@ -1,10 +1,10 @@
 import type { PeerId } from '../../protocol/control.ts';
 
 export interface PeerPerformance {
-  // Initial metrics. Will change on later version.
   pendingRequests: number;
   recentFailures?: number;
   latencyEmaMs?: number;
+  throughputEmaBytesPerSec?: number;
 }
 
 export interface HolderSelectionOptions {
@@ -55,7 +55,9 @@ function validatePerformance(stats: PeerPerformance): void {
       !Number.isSafeInteger(stats.recentFailures ?? 0) ||
       (stats.recentFailures ?? 0) < 0 ||
       !Number.isFinite(stats.latencyEmaMs ?? 0) ||
-      (stats.latencyEmaMs ?? 0) < 0) {
-    throw new RangeError('peer performance must contain non-negative counts and latency');
+      (stats.latencyEmaMs ?? 0) < 0 ||
+      !Number.isFinite(stats.throughputEmaBytesPerSec ?? 0) ||
+      (stats.throughputEmaBytesPerSec ?? 0) < 0) {
+    throw new RangeError('peer performance must contain non-negative metrics');
   }
 }
