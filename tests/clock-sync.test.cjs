@@ -126,3 +126,39 @@ test('accepts play/pause updates at the same revision without changing timeline'
     effectiveAt: 4000,
   })), { accepted: true, timelineChanged: true });
 });
+
+test('a host seek at a higher revision forces a seek even below the drift threshold', () => {
+  const clock = new ClockSynchronizer();
+  const sync = new PlaybackSynchronizer(clock);
+  clock.addSample({
+    clientSentAt: 1000,
+    trackerReceivedAt: 1070,
+    trackerSentAt: 1070,
+  }, 1040);
+  sync.applyPlaybackState(playbackState({ mediaTime: 10, effectiveAt: 3000 }));
+
+  assert.deepEqual(sync.applyPlaybackState(playbackState({
+    mediaTime: 10.5,
+    effectiveAt: 3000,
+    revision: 2,
+  })), { accepted: true, timelineChanged: true });
+
+  const seek = sync.evaluate(10, 2950);
+  assert.equal(seek.type, 'SEEK');
+  assert.equal(seek.targetMediaTimeSec, 10.5);
+  assert.equal(sync.evaluate(10, 2950).type, 'SEEK');
+  assert.equal(sync.evaluate(10.5, 2950).type, 'NONE');
+});
+
+test('a tiny intentional host seek still produces a seek decision', () => {
+  const clock = new ClockSynchronizer();
+  const sync = new PlaybackSynchronizer(clock);
+  clock.addSample({
+    clientSentAt: 1000, trackerReceivedAt: 1070, trackerSentAt: 1070,
+  }, 1040);
+  sync.applyPlaybackState(playbackState({ effectiveAt: 3000 }));
+  sync.applyPlaybackState(playbackState({
+    mediaTime: 10.1, effectiveAt: 3000, revision: 2,
+  }));
+  assert.equal(sync.evaluate(10, 2950).type, 'SEEK');
+});

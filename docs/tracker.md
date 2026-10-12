@@ -55,7 +55,9 @@ A WebSocket may register only once.
 
 For a viewer, the tracker removes the peer, its ledger claims, and all neighbor
 references, then repairs affected parent assignments. For the host, it closes
-the room and disconnects or notifies all viewers.
+the room and sends `ROOM_CLOSED_EVENT` with reason `HOST_DISCONNECTED` to each
+remaining viewer. The WebSocket server must send these returned messages before
+closing viewer connections or allowing them to register in another room.
 
 ## Message handling
 
@@ -83,8 +85,10 @@ disconnect handling can be added after measurement.
 
 Only messages bound to the host peer may change canonical playback state. The
 tracker assigns `effectiveAt` using its clock and stores the latest revision.
-Late joiners receive the latest state. Clock responses include tracker receive
-and send timestamps needed for offset estimation.
+The host keeps the revision for play/pause updates and increases it by one for
+each intentional seek. The tracker rejects older or skipped revisions. Late
+joiners receive the latest state. Clock responses include tracker receive and
+send timestamps needed for offset estimation.
 
 ## Initial limitations
 

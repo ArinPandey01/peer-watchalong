@@ -8,6 +8,7 @@ const CONTROL_MESSAGE_TYPES = new Set([
   'JOIN_ROOM_REQ',
   'JOIN_ROOM_RES',
   'TOPOLOGY_UPDATE_EVENT',
+  'ROOM_CLOSED_EVENT',
   'CHUNK_HAVE_EVENT',
   'CHUNK_QUERY_REQ',
   'CHUNK_QUERY_RES',
@@ -87,6 +88,19 @@ export function validateControlMessage(value: unknown): ControlMessage {
       assertExactKeys(message, baseKeys('payload'), 'message');
       validateTopologyPayload(message.payload);
       break;
+
+    case 'ROOM_CLOSED_EVENT': {
+      validateBaseMessage(message);
+      assertExactKeys(message, baseKeys('payload'), 'message');
+      const payload = assertObject(message.payload, 'message.payload');
+      assertExactKeys(payload, ['reason'], 'message.payload');
+      assertStringEnum(
+        payload.reason,
+        new Set(['HOST_DISCONNECTED'] as const),
+        'message.payload.reason',
+      );
+      break;
+    }
 
     case 'CHUNK_HAVE_EVENT':
     case 'CHUNK_QUERY_REQ':

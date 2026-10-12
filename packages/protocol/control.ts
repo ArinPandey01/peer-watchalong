@@ -8,6 +8,7 @@ export type ControlMessageType =
   | 'JOIN_ROOM_REQ'
   | 'JOIN_ROOM_RES'
   | 'TOPOLOGY_UPDATE_EVENT'
+  | 'ROOM_CLOSED_EVENT'
   | 'CHUNK_HAVE_EVENT'
   | 'CHUNK_QUERY_REQ'
   | 'CHUNK_QUERY_RES'
@@ -90,6 +91,13 @@ export interface TopologyUpdateEvent extends BaseControlMessage {
   type: 'TOPOLOGY_UPDATE_EVENT';
   payload: {
     topology: PeerTopology;
+  };
+}
+
+export interface RoomClosedEvent extends BaseControlMessage {
+  type: 'ROOM_CLOSED_EVENT';
+  payload: {
+    reason: 'HOST_DISCONNECTED';
   };
 }
 
@@ -205,6 +213,7 @@ export type ControlMessage =
   | JoinRoomReq
   | JoinRoomRes
   | TopologyUpdateEvent
+  | RoomClosedEvent
   | ChunkHaveEvent
   | ChunkQueryReq
   | ChunkQueryRes

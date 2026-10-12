@@ -19,6 +19,7 @@ export type PlaybackDecision =
 export const IN_SYNC_THRESHOLD_MS = 250;
 export const SEEK_THRESHOLD_MS = 2_000;
 const RATE_CORRECTION = 0.05;
+const SEEK_APPLIED_TOLERANCE_MS = 50;
 
 
 export function getTargetMediaTimeSec(
@@ -34,6 +35,7 @@ export function getTargetMediaTimeSec(
 
 export class PlaybackSynchronizer {
   private state: PlaybackState | null = null;
+  private seekForNewRevision = false;
   private readonly clock: ClockSynchronizer;
 
   constructor(clock: ClockSynchronizer) {
@@ -52,6 +54,9 @@ export class PlaybackSynchronizer {
 
     const timelineChanged =
       this.state === null || incoming.revision > this.state.revision;
+    if (this.state !== null && incoming.revision > this.state.revision) {
+      this.seekForNewRevision = true;
+    }
     this.state = { ...incoming };
     return { accepted: true, timelineChanged };
   }
@@ -82,6 +87,14 @@ export class PlaybackSynchronizer {
       playing: this.state.playing,
       playbackRate: this.state.playbackRate,
     };
+
+    if (this.seekForNewRevision) {
+      if (Math.abs(driftMs) <= SEEK_APPLIED_TOLERANCE_MS) {
+        this.seekForNewRevision = false;
+      } else {
+        return { type: 'SEEK', ...common };
+      }
+    }
 
     if (Math.abs(driftMs) >= SEEK_THRESHOLD_MS ||
         (!this.state.playing && Math.abs(driftMs) >= IN_SYNC_THRESHOLD_MS)) {
