@@ -69,8 +69,41 @@ const nextPeerId = ranked[0];
 The tracker decides which peers are eligible; ranking never adds a peer that
 the tracker did not return. Peers at the per-peer request limit (3 by default)
 are omitted. Remaining peers are ordered by fewer pending requests, fewer
-recent failures, lower latency, then peer ID. A later request-lifecycle PR
-will maintain those performance statistics and decide when to query or retry.
-For larger video segments, that PR should also measure completed transfer
-bytes per second and use the segment's byte length to estimate completion
-time. The current ranking is a fallback until those observations exist.
+recent failures, lower observed completion time, then peer ID.
+
+## Chunk request lifecycle
+
+`ChunkRequestScheduler` turns a plan into actions for the viewer to execute:
+
+- `QUERY_HOLDERS`: send `CHUNK_QUERY_REQ` to the tracker. Keep the local
+  `queryToken` associated with the control message ID, and pass the token back
+  with the matching `CHUNK_QUERY_RES` via `onHolders`.
+- `REQUEST_CHUNK`: send a data-protocol `REQUEST` to `peerId` using the numeric
+  `requestId` and `chunkIndex`. If sending fails, call `onRequestSendFailed`.
+- `CHUNK_RECEIVED`: cache the validated bytes, call `markOwned`, then announce
+  `CHUNK_HAVE_EVENT`. If storage fails, the next `updatePlan` can retry the
+  chunk. The scheduler does not cache bytes or send messages.
+
+Call `updatePlan(plan, playbackRevision, Date.now())` after computing a fresh
+plan, and call `tick(Date.now())` periodically to drive timeouts and retries.
+Pass `PAYLOAD` and `NOT_AVAILABLE` messages to `onData`, with the sending peer
+ID. For a payload, validate its bytes against the media manifest **before**
+passing `validPayload: true`; invalid bytes trigger a retry. A verified chunk
+obtained by another path can also be passed to `markOwned` once cached.
+
+Requests time out after 3 seconds by default. `NOT_AVAILABLE`, invalid bytes,
+send failures, and timeouts try a different known holder first. Empty or
+exhausted holder lists trigger a new tracker query after exponential backoff,
+bounded at 8 seconds. Query replies and data responses are matched to the
+current token or request ID; late responses after a timeout or playback
+revision change are ignored. A new revision cancels obsolete work locally;
+there is no wire-level cancel message.
+
+The scheduler caps active requests globally (6) and per peer (3), and active
+tracker queries globally (4). Its peer statistics include pending requests,
+recent failures, an exponential average of complete request time, and an
+exponential average of delivered bytes per second. Holder ranking currently
+uses the first three statistics; a future size-aware ranking can use the
+throughput estimate with each segment's byte length. The viewer must continue
+to plan and tick while playback progresses; this package has no timer of its
+own.
