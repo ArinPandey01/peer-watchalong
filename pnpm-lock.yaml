@@ -32,6 +32,8 @@ importers:
 
   packages/scheduler: {}
 
+  packages/tracker-client: {}
+
   packages/webrtc: {}
 
 packages:

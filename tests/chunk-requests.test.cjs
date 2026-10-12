@@ -28,7 +28,7 @@ test('queries the tracker, requests an eligible holder, and records a valid tran
     pendingRequests: 0, latencyEmaMs: 100,
     throughputEmaBytesPerSec: 10000, recentFailures: 0,
   });
-  scheduler.markOwned(0, 1130); 
+  scheduler.markOwned(0, 1130);
   assert.deepEqual(scheduler.updatePlan(plan(0), 1, 1200), []);
 });
 
