@@ -19,6 +19,10 @@ importers:
 
   packages/protocol: {}
 
+  packages/scheduler: {}
+
+  packages/webrtc: {}
+
 packages:
 
   '@types/node@24.13.3':
