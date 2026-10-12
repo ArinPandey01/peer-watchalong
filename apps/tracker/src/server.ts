@@ -3,15 +3,17 @@ import {
   TrackerControlHandler,
   type ConnectionId,
   type OutboundControlMessage,
-} from './control-handler';
+} from './control-handler.ts';
 
 export const DEFAULT_TRACKER_PORT = 8080;
 export const DEFAULT_MAX_PAYLOAD_BYTES = 64 * 1024;
+export const DEFAULT_CLOSE_GRACE_MS = 1000;
 
 export interface TrackerServerOptions {
   port?: number;
   host?: string;
   maxPayloadBytes?: number;
+  closeGraceMs?: number;
   handler?: TrackerControlHandler;
   createConnectionId?: () => ConnectionId;
   logger?: Pick<Console, 'info' | 'error'>;
@@ -22,13 +24,15 @@ export interface RunningTrackerServer {
   close(): Promise<void>;
 }
 
-export function startTrackerServer(
+export async function startTrackerServer(
   options: TrackerServerOptions = {},
-): RunningTrackerServer {
+): Promise<RunningTrackerServer> {
   const port = options.port ?? DEFAULT_TRACKER_PORT;
   const maxPayload = options.maxPayloadBytes ?? DEFAULT_MAX_PAYLOAD_BYTES;
+  const closeGraceMs = options.closeGraceMs ?? DEFAULT_CLOSE_GRACE_MS;
   assertPort(port);
   assertMaxPayload(maxPayload);
+  assertCloseGrace(closeGraceMs);
 
   const handler = options.handler ?? new TrackerControlHandler();
   const createConnectionId = options.createConnectionId ?? defaultCreateConnectionId;
@@ -46,6 +50,7 @@ export function startTrackerServer(
     sockets.set(connectionId, socket);
 
     socket.on('message', (data, isBinary) => {
+      if (socket.readyState !== WebSocket.OPEN) return;
       if (isBinary) {
         socket.close(1003, 'Control messages must be JSON text');
         return;
@@ -89,20 +94,28 @@ export function startTrackerServer(
     });
   });
 
-  server.on('listening', () => {
-    const address = server.address();
-    if (typeof address === 'object' && address !== null) {
-      logger.info(`Tracker listening on ws://${address.address}:${address.port}`);
-    }
+  server.on('error', (error) => logger.error('Tracker server error', error));
+  await new Promise<void>((resolve, reject) => {
+    const onListening = () => {
+      server.off('error', onStartupError);
+      resolve();
+    };
+    const onStartupError = (error: Error) => {
+      server.off('listening', onListening);
+      reject(error);
+    };
+    server.once('listening', onListening);
+    server.once('error', onStartupError);
   });
 
-  server.on('error', (error) => {
-    logger.error('Tracker server error', error);
-  });
-
+  const address = server.address();
+  if (typeof address === 'object' && address !== null) {
+    logger.info(`Tracker listening on ws://${address.address}:${address.port}`);
+  }
+  let closing: Promise<void> | null = null;
   return {
     server,
-    close: () => closeServer(server, sockets),
+    close: () => closing ??= closeServer(server, sockets, closeGraceMs),
   };
 }
 
@@ -139,13 +152,18 @@ function allocateConnectionId(
 function closeServer(
   server: WebSocketServer,
   sockets: ReadonlyMap<ConnectionId, WebSocket>,
+  closeGraceMs: number,
 ): Promise<void> {
-  for (const socket of sockets.values()) {
-    socket.close(1001, 'Tracker shutting down');
-  }
-
   return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      for (const socket of sockets.values()) socket.terminate();
+    }, closeGraceMs);
+    timer.unref();
+    for (const socket of sockets.values()) {
+      socket.close(1001, 'Tracker shutting down');
+    }
     server.close((error) => {
+      clearTimeout(timer);
       if (error) reject(error);
       else resolve();
     });
@@ -161,6 +179,12 @@ function assertPort(port: number): void {
 function assertMaxPayload(maxPayload: number): void {
   if (!Number.isInteger(maxPayload) || maxPayload <= 0) {
     throw new Error('Maximum payload size must be a positive integer');
+  }
+}
+
+function assertCloseGrace(closeGraceMs: number): void {
+  if (!Number.isSafeInteger(closeGraceMs) || closeGraceMs <= 0) {
+    throw new Error('Close grace period must be a positive integer');
   }
 }
 

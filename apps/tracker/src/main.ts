@@ -1,4 +1,4 @@
-import { startTrackerServer } from './server';
+import { startTrackerServer } from './server.ts';
 
 const port = readPositiveInteger('TRACKER_PORT', 8080, true);
 const maxPayloadBytes = readPositiveInteger(
@@ -7,7 +7,7 @@ const maxPayloadBytes = readPositiveInteger(
 );
 const host = process.env.TRACKER_HOST;
 
-const tracker = startTrackerServer({
+const tracker = await startTrackerServer({
   port,
   maxPayloadBytes,
   ...(host ? { host } : {}),
