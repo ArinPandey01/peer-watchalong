@@ -36,7 +36,11 @@ timestamps are Unix milliseconds. `driftMs` is positive when the viewer is
 behind the canonical timeline. Under 250 ms the decision returns the canonical
 playback rate; from 250 ms to 2 s it adjusts rate by 5%; at 2 s it seeks.
 Paused playback seeks once drift reaches 250 ms. The caller should wait for
-nearby media to be buffered before starting or seeking.
+nearby media to be buffered before starting or seeking. A higher playback
+revision forces a seek to the new target even below the normal drift threshold;
+the synchronizer keeps returning `SEEK` until the local position is within
+50 ms of that target. The viewer should apply the seek only after the needed
+chunks are ready.
 
 ## Chunk planning and holder choice
 

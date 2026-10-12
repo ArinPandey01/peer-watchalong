@@ -5,13 +5,13 @@ import type {
   PlaybackState,
   PlaybackUpdate,
   SessionId,
-} from '../../../packages/protocol/control';
+} from '../../../packages/protocol/control.ts';
 import {
   assignViewerLayer,
   buildPeerTopologies,
   compactViewerLayers,
   TopologyCapacityError,
-} from './topology';
+} from './topology.ts';
 
 export interface PeerState {
   peerId: PeerId;
@@ -47,6 +47,7 @@ export type RoomRegistryErrorCode =
   | 'SESSION_FULL'
   | 'PEER_NOT_FOUND'
   | 'NOT_HOST'
+  | 'INVALID_PLAYBACK_STATE'
   | 'STALE_PLAYBACK_REVISION';
 
 export class RoomRegistryError extends Error {
@@ -275,6 +276,12 @@ export class RoomRegistry {
       throw new RoomRegistryError(
         'STALE_PLAYBACK_REVISION',
         'Playback revision is older than the canonical state',
+      );
+    }
+    if (update.revision > room.playback.revision + 1) {
+      throw new RoomRegistryError(
+        'INVALID_PLAYBACK_STATE',
+        'A seek must increase the playback revision by one',
       );
     }
 
