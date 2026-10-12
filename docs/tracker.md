@@ -97,11 +97,3 @@ send timestamps needed for offset estimation.
 - There is no multi-tracker coordination.
 - Rate limits, heartbeat intervals, and stale-peer timeouts remain tuning
   values to define during implementation.
-
-## Running the WebSocket tracker
-
-Run `pnpm --filter @peer-watchalong/tracker start`. It listens on port 8080 by
-default. `TRACKER_HOST`, `TRACKER_PORT`, and `TRACKER_MAX_PAYLOAD_BYTES` can
-override the bind address, port, and maximum control-message size. Startup
-fails if the port cannot be bound. On shutdown, the server asks connected
-clients to close and terminates any that remain after one second.
