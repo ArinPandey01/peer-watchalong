@@ -105,15 +105,32 @@ Only tracker-authorized neighbors may signal or exchange chunks.
 
 ## Chunk discovery
 
+Before querying chunks, viewers fetch the current media manifest. The host
+sends `MEDIA_SET_REQ` with `{ manifest }` and receives `MEDIA_SET_RES` with
+`{ mediaId }`. A null manifest clears the current video. The tracker sends
+`MEDIA_EVENT` with `{ manifest }` to room members when it changes. A viewer
+joining later sends `MEDIA_GET_REQ` with `{}` and receives `MEDIA_GET_RES` with
+`{ manifest }`, which is null until the host selects a video.
+
+The manifest contains a unique `mediaId`, duration in seconds, one video track
+and optionally one audio track. Each track has an ID, kind, and MP4 codec MIME
+type. Each chunk has a sequential wire index, track ID, `init` or `media` kind,
+time range, byte length, and SHA-256 digest. Initialization chunks precede media chunks. The
+tracker stores only this metadata and clears old chunk claims on a new
+manifest. Manifests are limited to 512 chunks and 48 KiB of JSON.
+
 | Message | Direction | Payload |
 | --- | --- | --- |
-| `CHUNK_HAVE_EVENT` | Peer to tracker | `{ chunkIndex: number }` |
-| `CHUNK_QUERY_REQ` | Peer to tracker | `{ chunkIndex: number }` |
-| `CHUNK_QUERY_RES` | Tracker to peer | `{ chunkIndex: number, holderIds: string[] }` |
+| `CHUNK_HAVE_EVENT` | Peer to tracker | `{ mediaId: string, chunkIndex: number }` |
+| `CHUNK_QUERY_REQ` | Peer to tracker | `{ mediaId: string, chunkIndex: number }` |
+| `CHUNK_QUERY_RES` | Tracker to peer | `{ mediaId: string, chunkIndex: number, holderIds: string[] }` |
 
 `CHUNK_QUERY_RES.replyTo` references the query request. Returned holders must
 be active, authorized neighbors that claim to have the chunk. An empty
 `holderIds` array is a valid response.
+The tracker rejects claims and queries for an older media ID or an index
+outside the current manifest. A viewer checks the manifest digest before it
+caches a received chunk or announces that it has it.
 
 ## WebRTC signaling
 
@@ -124,6 +141,24 @@ be active, authorized neighbors that claim to have the chunk. An empty
 
 The tracker relays signaling only between authorized neighbors. These are
 relayed messages, not request/response pairs, so they do not use `replyTo`.
+
+## Clock and playback
+
+| Message | Direction | Payload |
+| --- | --- | --- |
+| `CLOCK_SYNC_REQ` | Peer to tracker | `{ clientSentAt: number }` |
+| `CLOCK_SYNC_RES` | Tracker to peer | `{ clientSentAt, trackerReceivedAt, trackerSentAt }` |
+| `PLAYBACK_SET_REQ` | Host to tracker | `{ playing, mediaTime, playbackRate, revision }` |
+| `PLAYBACK_STATE_EVENT` | Tracker to room | `{ state }` |
+| `PLAYBACK_STATE_REQ` | Peer to tracker | `{}` |
+| `PLAYBACK_STATE_RES` | Tracker to peer | `{ state }` |
+
+The tracker stamps accepted playback updates with `effectiveAt` in its own
+clock and distributes the resulting state. Viewers use the two tracker clock
+timestamps and their local send/receive timestamps to estimate clock offset.
+Only the host may send `PLAYBACK_SET_REQ`; its revision increases for seeks
+and a new media source, while play and pause keep the same revision. See
+[scheduling and playback sync](scheduling-and-sync.md) for the correction rules.
 
 ## Errors
 
@@ -153,7 +188,7 @@ unsigned 32-bit big-endian values.
 byte 0      opcode
 bytes 1-4   requestId
 bytes 5-8   chunkIndex
-bytes 9+    chunk bytes for PAYLOAD only
+bytes 9+    chunk bytes for PAYLOAD, or fragment metadata and bytes for FRAGMENT
 ```
 
 | Opcode | Message | Size |
@@ -161,10 +196,17 @@ bytes 9+    chunk bytes for PAYLOAD only
 | `0x01` | `REQUEST` | 9 bytes |
 | `0x02` | `PAYLOAD` | 9-byte header plus chunk bytes |
 | `0x03` | `NOT_AVAILABLE` | 9 bytes |
+| `0x04` | `FRAGMENT` | 17-byte header plus fragment bytes |
 
 `PAYLOAD` and `NOT_AVAILABLE` repeat the request's `requestId` and
 `chunkIndex`. `NOT_AVAILABLE` means the peer responded but lacks the chunk; a
 timeout means no response was received.
 
-Packets with unknown opcodes, invalid sizes, or an empty `PAYLOAD` are
+When a media chunk exceeds one DataChannel packet, `FRAGMENT` carries its
+`totalBytes` in bytes 9–12 and its byte `offset` in bytes 13–16. Both are
+unsigned 32-bit big-endian values. The remaining bytes carry a contiguous
+piece of the requested chunk. The browser exchange caps each packet at 16 KiB
+and reassembles fragments before handing the chunk to the scheduler.
+
+Packets with unknown opcodes, invalid sizes, or an empty `PAYLOAD` or `FRAGMENT` are
 rejected.

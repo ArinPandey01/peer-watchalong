@@ -11,13 +11,16 @@ Priority order:
 2. the next chunks required to start or continue playback; and
 3. later chunks in the look-ahead window.
 
+The viewer looks ahead 16 seconds by default. MP4 audio and video segments
+overlap in time, so the web app plans both tracks together rather than using
+the single-timeline `planNeededChunks` helper directly.
 
 ## Request rules
 
 - Prefer an eligible holder with fewer active requests and better recent
   response time.
 - Avoid retrying the same holder when another holder is available.
-- Apply a timeout per request; start with 3 seconds and measure it.
+- Time out a chunk request after 3 seconds by default.
 - `NOT_AVAILABLE` completes the request immediately and triggers another
   holder choice.
 - A timeout lowers confidence in the holder but does not prove it lacks the
@@ -25,9 +28,18 @@ Priority order:
 - If no holder is known, query again with bounded backoff.
 - Validate a payload before caching it or announcing `CHUNK_HAVE_EVENT`.
 
+The viewer checks the chunk's SHA-256 digest from the current media manifest.
+Claims and queries include that manifest's media ID, so claims for a replaced
+video cannot be reused.
+
 The host is the final fallback for chunks when it is an authorized holder.
 Schedulers must limit concurrent requests per peer to avoid overloading one
 uploader.
+
+The current scheduler allows up to 6 active chunk requests, 4 active tracker
+queries, and 3 active requests to one peer. Empty or exhausted holder results
+are retried with exponential backoff, capped at 8 seconds. These are defaults,
+not benchmarked tuning results.
 
 ## Seeks and cancellation
 
@@ -80,9 +92,14 @@ round-trip, prefer low-latency samples, and refresh the estimate periodically.
 
 Initial correction policy:
 
-- under 250 ms drift: do nothing;
-- 250 ms–2 s drift: temporarily adjust playback rate within `0.95–1.05`;
-- over 2 s drift: seek to the expected position.
+- under 250 ms drift: use the host's normal playback rate;
+- 250 ms–2 s drift: temporarily use 95% or 105% of the host's rate;
+- at 2 s drift or more: seek to the expected position.
+
+When paused, a 250 ms difference is enough to trigger a seek. A new playback
+revision also forces a seek even if the difference is smaller. While the host
+is playing, a viewer waits for a tracker clock sample before deriving the
+target position.
 
 These thresholds are tuning defaults. A viewer starts or rejoins only after it
 has the required nearby chunks buffered.

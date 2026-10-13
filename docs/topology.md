@@ -1,58 +1,35 @@
 # Topology
 
-## Shape
+The tracker owns placement and neighbor authorization. The host is the only
+peer in Layer 0. Viewers occupy Layers 1–5; each layer targets three viewers
+and has a hard limit of five. A new layer is used only when its parent layer is
+nonempty. The configured maximum is 25 viewers plus the host; this has not
+been load-tested.
 
-- The host is the only peer in Layer 0.
-- Viewers occupy Layers 1–5.
-- Each viewer layer targets 3 peers and has a hard limit of 5.
-- The tracker is authoritative for placement and neighbor authorization.
-- A peer's layer stays stable during normal joins and departures.
-- A layer can contain no less than 2 peer if there are at least 4 peers.
+## Placement and neighbors
 
-## Placement
+For each new viewer, the tracker first fills Layers 1–5 toward the target of
+three viewers per layer, then fills remaining slots toward the limit of five.
+It returns `SESSION_FULL` when there is no slot.
 
-For a new viewer, the tracker:
+Each viewer can have siblings in its own layer, parents in the layer above,
+and children in the layer below. Layer 1 viewers use the host as their parent.
+Other viewers receive up to two parents, preferring parents with fewer
+assigned children. Neighbor relationships are symmetric. Holder queries return
+only peers that are both active and authorized neighbors.
 
-1. fills Layers 1–5 in order to the target of 3;
-2. then fills spare capacity in order to the hard limit of 5; and
-3. returns `SESSION_FULL` when every viewer layer is full.
+## WebRTC connections
 
-A layer may be used only when the layer above it contains a peer. This model
-supports at most 25 viewers plus the host.
-
-## Authorized neighbors
-
-A viewer may be authorized with:
-
-- parents in the layer above;
-- children in the layer below; and
-- siblings in the same layer.
-
-Layer 1 viewers use the host as their parent. Other viewers receive up to two
-parents, preferring peers with fewer assigned children. All peers in the same
-viewer layer may be siblings because a layer contains at most five peers.
-
-Authorization is symmetric: if A lists B as a neighbor, B lists A in the
-corresponding relationship. Chunk discovery returns only authorized neighbors.
-
-## Connections
-
-- A child initiates the WebRTC connection to its parent.
-- Between siblings, the peer with the lexicographically smaller `peerId`
-  initiates.
-- Only one peer connection exists for an authorized pair.
-- Authorization permits a connection; it does not require every sibling
-  connection to remain open.
-- The tracker rejects signaling between unauthorized peers.
+For every authorized pair, the browser with the lexicographically smaller
+tracker-assigned peer ID initiates the connection; the other is the polite
+side for offer-collision handling. The tracker forwards SDP and ICE only
+between authorized neighbors. A peer has at most one connection to a given
+neighbor, and the room's peer count in the UI counts open DataChannels rather
+than all room members.
 
 ## Changes and departures
 
-When topology changes, the tracker sends each affected peer a complete
-replacement topology, not a partial patch.
-
-When a viewer leaves, the tracker removes it from all neighbor lists and gives
-its children replacement parents where possible. If the viewer leaving doesn't create a dramatic drop in performance, it does not rebalance layers
-only to make them visually even.
-
-When the host disconnects, the room closes. Host migration is outside the
-initial scope.
+When a viewer leaves, the tracker removes its chunk claims, compacts layers if
+there is a gap, rebuilds neighbor assignments, and sends complete replacement
+topologies to affected peers. This can change a remaining viewer's layer.
+When the host disconnects, the room closes; there is no host migration.
