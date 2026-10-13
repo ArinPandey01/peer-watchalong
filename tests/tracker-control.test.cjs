@@ -26,6 +26,68 @@ function setup() {
   return { handler, registry, request, create, join, setNow: (value) => { now = value; } };
 }
 
+function manifest(mediaId = 'media-1') {
+  return {
+    mediaId,
+    durationSec: 4,
+    tracks: [{ id: 1, kind: 'video', mimeType: 'video/mp4; codecs="avc1.64000a"' }],
+    chunks: [
+      { chunkIndex: 0, trackId: 1, kind: 'init', startTimeSec: 0, endTimeSec: 0, byteLength: 50, sha256: '0'.repeat(64) },
+      { chunkIndex: 1, trackId: 1, kind: 'media', startTimeSec: 0, endTimeSec: 4, byteLength: 100, sha256: '1'.repeat(64) },
+    ],
+  };
+}
+
+test('only host sets media, late viewers retrieve it, and replacement clears old claims', () => {
+  const { handler, request, create, join } = setup();
+  const host = create().payload.assignedPeerId;
+  const viewer = join('viewer').payload.assignedPeerId;
+  const first = manifest();
+  const denied = handler.handle('viewer', request('MEDIA_SET_REQ', viewer, { manifest: first }));
+  assert.equal(denied[0].message.payload.code, 'NOT_HOST');
+
+  const published = handler.handle('host', request('MEDIA_SET_REQ', host, { manifest: first }));
+  assert.equal(published[0].message.type, 'MEDIA_SET_RES');
+  assert.equal(published[0].message.payload.mediaId, 'media-1');
+  assert.equal(published.filter(({ message }) => message.type === 'MEDIA_EVENT').length, 2);
+  for (const outbound of published) assert.doesNotThrow(() => validateControlMessage(outbound.message));
+  const late = join('late').payload.assignedPeerId;
+  const fetched = handler.handle('late', request('MEDIA_GET_REQ', late, {}))[0].message;
+  assert.deepEqual(fetched.payload.manifest, first);
+
+  handler.handle('host', request('CHUNK_HAVE_EVENT', host,
+    { mediaId: 'media-1', chunkIndex: 1 }));
+  const holdersBefore = handler.handle('viewer', request('CHUNK_QUERY_REQ', viewer,
+    { mediaId: 'media-1', chunkIndex: 1 }))[0].message.payload.holderIds;
+  assert.deepEqual(holdersBefore, [host]);
+  handler.handle('host', request('MEDIA_SET_REQ', host, { manifest: manifest('media-2') }));
+  const staleQuery = handler.handle('viewer', request('CHUNK_QUERY_REQ', viewer,
+    { mediaId: 'media-1', chunkIndex: 1 }))[0].message;
+  assert.equal(staleQuery.payload.code, 'INVALID_CHUNK');
+  const staleClaim = handler.handle('host', request('CHUNK_HAVE_EVENT', host,
+    { mediaId: 'media-1', chunkIndex: 1 }))[0].message;
+  assert.equal(staleClaim.payload.code, 'INVALID_CHUNK');
+  const holdersAfter = handler.handle('viewer', request('CHUNK_QUERY_REQ', viewer,
+    { mediaId: 'media-2', chunkIndex: 1 }))[0].message.payload.holderIds;
+  assert.deepEqual(holdersAfter, []);
+  handler.handle('host', request('MEDIA_SET_REQ', host, { manifest: null }));
+  assert.equal(handler.handle('late', request('MEDIA_GET_REQ', late, {}))[0]
+    .message.payload.manifest, null);
+});
+
+test('rejects malformed media metadata before it reaches the room', () => {
+  const { handler, request, create } = setup();
+  const host = create().payload.assignedPeerId;
+  const bad = manifest();
+  bad.chunks[1].chunkIndex = 7;
+  assert.equal(handler.handle('host', request('MEDIA_SET_REQ', host, { manifest: bad }))[0]
+    .message.payload.code, 'INVALID_MESSAGE');
+  const another = manifest();
+  another.tracks[0].mimeType = 'text/html';
+  assert.equal(handler.handle('host', request('MEDIA_SET_REQ', host, { manifest: another }))[0]
+    .message.payload.code, 'INVALID_MESSAGE');
+});
+
 test('binds connections and rejects spoofed playback or signaling', () => {
   const { handler, request, create, join } = setup();
   const host = create().payload.assignedPeerId;
@@ -47,12 +109,14 @@ test('answers holder queries only with authorized peers that claim the chunk', (
   const { handler, request, create, join } = setup();
   const host = create().payload.assignedPeerId;
   const viewer = join('viewer').payload.assignedPeerId;
-  handler.handle('host', request('CHUNK_HAVE_EVENT', host, { chunkIndex: 4 }));
+  handler.handle('host', request('MEDIA_SET_REQ', host, { manifest: manifest() }));
+  handler.handle('host', request('CHUNK_HAVE_EVENT', host,
+    { mediaId: 'media-1', chunkIndex: 1 }));
   const response = handler.handle('viewer', request('CHUNK_QUERY_REQ', viewer, {
-    chunkIndex: 4,
-  }, 'query-4'))[0].message;
+    mediaId: 'media-1', chunkIndex: 1,
+  }, 'query-1'))[0].message;
   assert.equal(response.type, 'CHUNK_QUERY_RES');
-  assert.equal(response.replyTo, 'query-4');
+  assert.equal(response.replyTo, 'query-1');
   assert.deepEqual(response.payload.holderIds, [host]);
 });
 

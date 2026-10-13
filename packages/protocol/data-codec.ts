@@ -1,4 +1,4 @@
-import { DATA_PROTOCOL, DataOpcode } from './data';
+import { DATA_PROTOCOL, DataOpcode } from './data.ts';
 import type { DataMessage } from './data';
 
 const REQUEST_ID_OFFSET = DATA_PROTOCOL.OPCODE_SIZE;
@@ -43,6 +43,27 @@ export function encodeDataMessage(message: DataMessage): Uint8Array {
         message.chunkIndex,
       );
       packet.set(message.data, DATA_PROTOCOL.PAYLOAD_HEADER_SIZE);
+      return packet;
+    }
+
+    case DataOpcode.FRAGMENT: {
+      if (!(message.data instanceof Uint8Array)) {
+        throw new TypeError('FRAGMENT data must be a Uint8Array');
+      }
+      assertUint32(message.totalBytes, 'totalBytes');
+      assertUint32(message.offset, 'offset');
+      if (message.totalBytes === 0 || message.data.byteLength === 0 ||
+          message.offset + message.data.byteLength > message.totalBytes) {
+        throw new RangeError('FRAGMENT range must fit within a nonempty chunk');
+      }
+      const packet = new Uint8Array(
+        DATA_PROTOCOL.FRAGMENT_HEADER_SIZE + message.data.byteLength,
+      );
+      writeHeader(packet, DataOpcode.FRAGMENT, message.requestId, message.chunkIndex);
+      const view = new DataView(packet.buffer);
+      view.setUint32(DATA_PROTOCOL.PAYLOAD_HEADER_SIZE, message.totalBytes, false);
+      view.setUint32(DATA_PROTOCOL.PAYLOAD_HEADER_SIZE + 4, message.offset, false);
+      packet.set(message.data, DATA_PROTOCOL.FRAGMENT_HEADER_SIZE);
       return packet;
     }
 
@@ -96,13 +117,26 @@ export function decodeDataMessage(
         data: packet.slice(DATA_PROTOCOL.PAYLOAD_HEADER_SIZE),
       };
 
+    case DataOpcode.FRAGMENT: {
+      if (packet.byteLength <= DATA_PROTOCOL.FRAGMENT_HEADER_SIZE) {
+        throw new RangeError('FRAGMENT data must not be empty');
+      }
+      const totalBytes = view.getUint32(DATA_PROTOCOL.PAYLOAD_HEADER_SIZE, false);
+      const offset = view.getUint32(DATA_PROTOCOL.PAYLOAD_HEADER_SIZE + 4, false);
+      const data = packet.slice(DATA_PROTOCOL.FRAGMENT_HEADER_SIZE);
+      if (totalBytes === 0 || offset + data.byteLength > totalBytes) {
+        throw new RangeError('FRAGMENT range exceeds its chunk');
+      }
+      return { opcode, requestId, chunkIndex, totalBytes, offset, data };
+    }
+
     default:
       throw new RangeError(`Unknown data opcode: ${opcode}`);
   }
 }
 
 function encodeHeaderOnlyMessage(
-  opcode: DataOpcode.REQUEST | DataOpcode.NOT_AVAILABLE,
+  opcode: typeof DataOpcode.REQUEST | typeof DataOpcode.NOT_AVAILABLE,
   requestId: number,
   chunkIndex: number,
 ): Uint8Array {

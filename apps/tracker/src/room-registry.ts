@@ -1,5 +1,6 @@
 import type {
   Layer,
+  MediaManifest,
   PeerId,
   PeerTopology,
   PlaybackState,
@@ -26,6 +27,7 @@ export interface RoomState {
   hostPeerId: PeerId;
   peers: Map<PeerId, PeerState>;
   chunkHolders: Map<number, Set<PeerId>>;
+  media: MediaManifest | null;
   playback: PlaybackState;
 }
 
@@ -47,6 +49,7 @@ export type RoomRegistryErrorCode =
   | 'SESSION_FULL'
   | 'PEER_NOT_FOUND'
   | 'NOT_HOST'
+  | 'INVALID_CHUNK'
   | 'INVALID_PLAYBACK_STATE'
   | 'STALE_PLAYBACK_REVISION';
 
@@ -102,6 +105,7 @@ export class RoomRegistry {
       hostPeerId,
       peers: new Map([[hostPeerId, host]]),
       chunkHolders: new Map(),
+      media: null,
       playback: {
         playing: false,
         mediaTime: 0,
@@ -156,6 +160,17 @@ export class RoomRegistry {
     return this.rooms.get(sessionId)?.peers.get(peerId);
   }
 
+  setMedia(sessionId: SessionId, peerId: PeerId, manifest: MediaManifest | null): MediaManifest | null {
+    const room = this.requireRoom(sessionId);
+    this.requirePeer(room, peerId);
+    if (peerId !== room.hostPeerId) {
+      throw new RoomRegistryError('NOT_HOST', 'Only the host may select media');
+    }
+    room.media = manifest ? structuredClone(manifest) : null;
+    room.chunkHolders.clear();
+    return room.media;
+  }
+
   touchPeer(sessionId: SessionId, peerId: PeerId): void {
     this.requirePeer(this.requireRoom(sessionId), peerId).lastSeenAt = this.now();
   }
@@ -202,11 +217,13 @@ export class RoomRegistry {
   announceChunk(
     sessionId: SessionId,
     peerId: PeerId,
+    mediaId: string,
     chunkIndex: number,
   ): void {
     const room = this.requireRoom(sessionId);
     this.requirePeer(room, peerId);
     assertChunkIndex(chunkIndex);
+    this.assertCurrentChunk(room, mediaId, chunkIndex);
 
     let holders = room.chunkHolders.get(chunkIndex);
     if (!holders) {
@@ -219,11 +236,13 @@ export class RoomRegistry {
   getEligibleChunkHolders(
     sessionId: SessionId,
     requesterId: PeerId,
+    mediaId: string,
     chunkIndex: number,
   ): PeerId[] {
     const room = this.requireRoom(sessionId);
     const requester = this.requirePeer(room, requesterId);
     assertChunkIndex(chunkIndex);
+    this.assertCurrentChunk(room, mediaId, chunkIndex);
 
     const authorizedNeighbors = new Set([
       ...requester.topology.parents,
@@ -313,6 +332,12 @@ export class RoomRegistry {
       if (holders.size === 0) {
         room.chunkHolders.delete(chunkIndex);
       }
+    }
+  }
+
+  private assertCurrentChunk(room: RoomState, mediaId: string, chunkIndex: number): void {
+    if (room.media?.mediaId !== mediaId || chunkIndex >= room.media.chunks.length) {
+      throw new RoomRegistryError('INVALID_CHUNK', 'Chunk does not belong to the current video');
     }
   }
 

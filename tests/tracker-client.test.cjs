@@ -144,7 +144,7 @@ test('room closure clears identity, rejects room requests, and reports the reaso
 
   const closed = [];
   client.on('roomClosed', (event) => closed.push(event));
-  const query = client.queryChunk(4);
+  const query = client.queryChunk('media-1', 4);
   sockets[0].receive(serverMessage('ROOM_CLOSED_EVENT', {
     reason: 'HOST_DISCONNECTED',
   }));
@@ -152,6 +152,6 @@ test('room closure clears identity, rejects room requests, and reports the reaso
   await assert.rejects(query, /room closed/);
   assert.deepEqual(closed, [{ reason: 'HOST_DISCONNECTED' }]);
   assert.equal(client.identity, null);
-  assert.throws(() => client.queryChunk(4), /not registered/);
+  assert.throws(() => client.queryChunk('media-1', 4), /not registered/);
   client.disconnect();
 });

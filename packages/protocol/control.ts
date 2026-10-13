@@ -12,6 +12,11 @@ export type ControlMessageType =
   | 'CHUNK_HAVE_EVENT'
   | 'CHUNK_QUERY_REQ'
   | 'CHUNK_QUERY_RES'
+  | 'MEDIA_SET_REQ'
+  | 'MEDIA_SET_RES'
+  | 'MEDIA_EVENT'
+  | 'MEDIA_GET_REQ'
+  | 'MEDIA_GET_RES'
   | 'SIGNAL_SDP'
   | 'SIGNAL_ICE'
   | 'CLOCK_SYNC_REQ'
@@ -60,6 +65,25 @@ export interface PlaybackUpdate {
   revision: number;
 }
 
+export interface MediaManifest {
+  mediaId: string;
+  durationSec: number;
+  tracks: Array<{
+    id: number;
+    kind: 'audio' | 'video';
+    mimeType: string;
+  }>;
+  chunks: Array<{
+    chunkIndex: number;
+    trackId: number;
+    kind: 'init' | 'media';
+    startTimeSec: number;
+    endTimeSec: number;
+    byteLength: number;
+    sha256: string;
+  }>;
+}
+
 export interface CreateRoomReq extends BaseControlMessage {
   type: 'CREATE_ROOM_REQ';
   payload: Record<string, never>;
@@ -104,6 +128,7 @@ export interface RoomClosedEvent extends BaseControlMessage {
 export interface ChunkHaveEvent extends PeerControlMessage {
   type: 'CHUNK_HAVE_EVENT';
   payload: {
+    mediaId: string;
     chunkIndex: number;
   };
 }
@@ -111,6 +136,7 @@ export interface ChunkHaveEvent extends PeerControlMessage {
 export interface ChunkQueryReq extends PeerControlMessage {
   type: 'CHUNK_QUERY_REQ';
   payload: {
+    mediaId: string;
     chunkIndex: number;
   };
 }
@@ -118,9 +144,35 @@ export interface ChunkQueryReq extends PeerControlMessage {
 export interface ChunkQueryRes extends ResponseControlMessage {
   type: 'CHUNK_QUERY_RES';
   payload: {
+    mediaId: string;
     chunkIndex: number;
     holderIds: PeerId[];
   };
+}
+
+export interface MediaSetReq extends PeerControlMessage {
+  type: 'MEDIA_SET_REQ';
+  payload: { manifest: MediaManifest | null };
+}
+
+export interface MediaSetRes extends ResponseControlMessage {
+  type: 'MEDIA_SET_RES';
+  payload: { mediaId: string | null };
+}
+
+export interface MediaEvent extends BaseControlMessage {
+  type: 'MEDIA_EVENT';
+  payload: { manifest: MediaManifest | null };
+}
+
+export interface MediaGetReq extends PeerControlMessage {
+  type: 'MEDIA_GET_REQ';
+  payload: Record<string, never>;
+}
+
+export interface MediaGetRes extends ResponseControlMessage {
+  type: 'MEDIA_GET_RES';
+  payload: { manifest: MediaManifest | null };
 }
 
 export interface SignalSdp extends PeerControlMessage {
@@ -217,6 +269,11 @@ export type ControlMessage =
   | ChunkHaveEvent
   | ChunkQueryReq
   | ChunkQueryRes
+  | MediaSetReq
+  | MediaSetRes
+  | MediaEvent
+  | MediaGetReq
+  | MediaGetRes
   | SignalSdp
   | SignalIce
   | ClockSyncReq

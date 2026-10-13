@@ -12,6 +12,11 @@ const CONTROL_MESSAGE_TYPES = new Set([
   'CHUNK_HAVE_EVENT',
   'CHUNK_QUERY_REQ',
   'CHUNK_QUERY_RES',
+  'MEDIA_SET_REQ',
+  'MEDIA_SET_RES',
+  'MEDIA_EVENT',
+  'MEDIA_GET_REQ',
+  'MEDIA_GET_RES',
   'SIGNAL_SDP',
   'SIGNAL_ICE',
   'CLOCK_SYNC_REQ',
@@ -113,6 +118,39 @@ export function validateControlMessage(value: unknown): ControlMessage {
       validateResponseMessage(message);
       assertExactKeys(message, responseKeys('payload'), 'message');
       validateChunkQueryResponsePayload(message.payload);
+      break;
+
+    case 'MEDIA_SET_REQ':
+      validatePeerMessage(message);
+      assertExactKeys(message, peerKeys('payload'), 'message');
+      validateManifestPayload(message.payload, true);
+      break;
+
+    case 'MEDIA_SET_RES': {
+      validateResponseMessage(message);
+      assertExactKeys(message, responseKeys('payload'), 'message');
+      const payload = assertObject(message.payload, 'message.payload');
+      assertExactKeys(payload, ['mediaId'], 'message.payload');
+      if (payload.mediaId !== null) assertMediaId(payload.mediaId, 'message.payload.mediaId');
+      break;
+    }
+
+    case 'MEDIA_EVENT':
+      validateBaseMessage(message);
+      assertExactKeys(message, baseKeys('payload'), 'message');
+      validateManifestPayload(message.payload, true);
+      break;
+
+    case 'MEDIA_GET_REQ':
+      validatePeerMessage(message);
+      assertExactKeys(message, peerKeys('payload'), 'message');
+      validateEmptyPayload(message.payload);
+      break;
+
+    case 'MEDIA_GET_RES':
+      validateResponseMessage(message);
+      assertExactKeys(message, responseKeys('payload'), 'message');
+      validateManifestPayload(message.payload, true);
       break;
 
     case 'SIGNAL_SDP':
@@ -251,7 +289,8 @@ function validateTopology(value: unknown, path: string): void {
 
 function validateChunkIndexPayload(value: unknown): void {
   const payload = assertObject(value, 'message.payload');
-  assertExactKeys(payload, ['chunkIndex'], 'message.payload');
+  assertExactKeys(payload, ['mediaId', 'chunkIndex'], 'message.payload');
+  assertMediaId(payload.mediaId, 'message.payload.mediaId');
   assertUint32(payload.chunkIndex, 'message.payload.chunkIndex');
 }
 
@@ -259,11 +298,100 @@ function validateChunkQueryResponsePayload(value: unknown): void {
   const payload = assertObject(value, 'message.payload');
   assertExactKeys(
     payload,
-    ['chunkIndex', 'holderIds'],
+    ['mediaId', 'chunkIndex', 'holderIds'],
     'message.payload',
   );
+  assertMediaId(payload.mediaId, 'message.payload.mediaId');
   assertUint32(payload.chunkIndex, 'message.payload.chunkIndex');
   assertIdentifierArray(payload.holderIds, 'message.payload.holderIds');
+}
+
+function validateManifestPayload(value: unknown, nullable: boolean): void {
+  const payload = assertObject(value, 'message.payload');
+  assertExactKeys(payload, ['manifest'], 'message.payload');
+  if (nullable && payload.manifest === null) return;
+  validateManifest(payload.manifest);
+}
+
+function validateManifest(value: unknown): void {
+  const manifest = assertObject(value, 'message.payload.manifest');
+  const root = 'message.payload.manifest';
+  assertExactKeys(manifest, ['mediaId', 'durationSec', 'tracks', 'chunks'], root);
+  assertMediaId(manifest.mediaId, `${root}.mediaId`);
+  assertPositiveFiniteNumber(manifest.durationSec, `${root}.durationSec`);
+  if (!Array.isArray(manifest.tracks) || manifest.tracks.length < 1 ||
+      manifest.tracks.length > 2) fail(`${root}.tracks must contain one or two tracks`);
+  const trackKinds = new Set<string>();
+  const trackIds = new Set<number>();
+  for (const [index, value] of manifest.tracks.entries()) {
+    const path = `${root}.tracks[${index}]`;
+    const track = assertObject(value, path);
+    assertExactKeys(track, ['id', 'kind', 'mimeType'], path);
+    assertUint32(track.id, `${path}.id`);
+    assertStringEnum(track.kind, new Set(['audio', 'video'] as const), `${path}.kind`);
+    assertString(track.mimeType, `${path}.mimeType`);
+    if (track.id === 0 || trackIds.has(track.id) || trackKinds.has(track.kind)) {
+      fail(`${path} has a duplicate or invalid track`);
+    }
+    if (!new RegExp(`^${track.kind}/mp4; codecs="[A-Za-z0-9.,_-]{1,80}"$`).test(track.mimeType)) {
+      fail(`${path}.mimeType must describe an MP4 codec`);
+    }
+    trackIds.add(track.id);
+    trackKinds.add(track.kind);
+  }
+  if (!trackKinds.has('video')) fail(`${root}.tracks must include video`);
+  if (!Array.isArray(manifest.chunks) || manifest.chunks.length < trackIds.size + 1 ||
+      manifest.chunks.length > 512) fail(`${root}.chunks has an unsupported length`);
+  const initialized = new Set<number>();
+  const mediaTracks = new Set<number>();
+  const lastEnd = new Map<number, number>();
+  for (const [index, value] of manifest.chunks.entries()) {
+    const path = `${root}.chunks[${index}]`;
+    const chunk = assertObject(value, path);
+    assertExactKeys(chunk,
+      ['chunkIndex', 'trackId', 'kind', 'startTimeSec', 'endTimeSec', 'byteLength', 'sha256'], path);
+    assertUint32(chunk.chunkIndex, `${path}.chunkIndex`);
+    assertUint32(chunk.trackId, `${path}.trackId`);
+    assertStringEnum(chunk.kind, new Set(['init', 'media'] as const), `${path}.kind`);
+    assertNonNegativeFiniteNumber(chunk.startTimeSec, `${path}.startTimeSec`);
+    assertNonNegativeFiniteNumber(chunk.endTimeSec, `${path}.endTimeSec`);
+    assertUint32(chunk.byteLength, `${path}.byteLength`);
+    assertString(chunk.sha256, `${path}.sha256`);
+    if (!/^[0-9a-f]{64}$/.test(chunk.sha256)) {
+      fail(`${path}.sha256 must be a SHA-256 hex digest`);
+    }
+    if (chunk.chunkIndex !== index || !trackIds.has(chunk.trackId) ||
+        chunk.byteLength < 1 || chunk.byteLength > 16 * 1024 * 1024) {
+      fail(`${path} has an invalid index, track, or size`);
+    }
+    if (chunk.kind === 'init') {
+      if (initialized.has(chunk.trackId) || mediaTracks.size > 0 ||
+          chunk.startTimeSec !== 0 || chunk.endTimeSec !== 0) {
+        fail(`${path} has an invalid initialization segment`);
+      }
+      initialized.add(chunk.trackId);
+    } else {
+      if (!initialized.has(chunk.trackId) ||
+          chunk.endTimeSec <= chunk.startTimeSec ||
+          chunk.endTimeSec > (manifest.durationSec as number) + 1 ||
+          chunk.startTimeSec < (lastEnd.get(chunk.trackId) ?? 0) - 0.25) {
+        fail(`${path} has an invalid media time range`);
+      }
+      lastEnd.set(chunk.trackId, chunk.endTimeSec as number);
+      mediaTracks.add(chunk.trackId);
+    }
+  }
+  if (initialized.size !== trackIds.size || mediaTracks.size !== trackIds.size) {
+    fail(`${root}.chunks must initialize every track and contain media for each track`);
+  }
+  if (JSON.stringify(manifest).length > 48 * 1024) {
+    fail(`${root} exceeds the size limit`);
+  }
+}
+
+function assertMediaId(value: unknown, path: string): asserts value is string {
+  assertNonEmptyString(value, path);
+  if (value.length > 64) fail(`${path} is too long`);
 }
 
 function validateSdpPayload(value: unknown): void {
@@ -480,7 +608,7 @@ function assertBoolean(value: unknown, path: string): void {
   }
 }
 
-function assertUint32(value: unknown, path: string): void {
+function assertUint32(value: unknown, path: string): asserts value is number {
   if (
     typeof value !== 'number' ||
     !Number.isInteger(value) ||
@@ -502,13 +630,13 @@ function assertLayer(value: unknown, path: string): void {
   }
 }
 
-function assertNonNegativeFiniteNumber(value: unknown, path: string): void {
+function assertNonNegativeFiniteNumber(value: unknown, path: string): asserts value is number {
   if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
     fail(`${path} must be a non-negative finite number`);
   }
 }
 
-function assertPositiveFiniteNumber(value: unknown, path: string): void {
+function assertPositiveFiniteNumber(value: unknown, path: string): asserts value is number {
   if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
     fail(`${path} must be a positive finite number`);
   }
