@@ -2,6 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { TrackerRequestError } = require('../packages/tracker-client/src/tracker-client.ts');
 const { RoomController } = require('../apps/web/src/room-controller.ts');
+const { HostPlaybackPublisher } = require('../apps/web/src/host-playback.ts');
 const {
   generateRoomCode,
   normalizeRoomCode,
@@ -12,6 +13,12 @@ class FakeTracker {
   listeners = new Map();
   created = [];
   joined = [];
+  playbackUpdates = [];
+  media = null;
+  announcedChunks = [];
+  playbackState = {
+    playing: false, mediaTime: 0, playbackRate: 1, revision: 0, effectiveAt: 1000,
+  };
   disconnected = false;
   connectResult = Promise.resolve();
   createResult = async () => {};
@@ -31,6 +38,26 @@ class FakeTracker {
   connect() { return this.connectResult; }
   async createRoom(code) { this.created.push(code); await this.createResult(code); }
   async joinRoom(code) { this.joined.push(code); await this.joinResult(code); }
+  requestPlaybackState() { return Promise.resolve({ payload: { state: this.playbackState } }); }
+  requestMedia() { return Promise.resolve({ payload: { manifest: this.media } }); }
+  setMedia(manifest) {
+    this.media = manifest;
+    this.emit('media', manifest);
+    return Promise.resolve({ payload: { mediaId: manifest?.mediaId ?? null } });
+  }
+  announceChunk(mediaId, chunkIndex) { this.announcedChunks.push({ mediaId, chunkIndex }); }
+  queryChunk(mediaId, chunkIndex) {
+    return Promise.resolve({ payload: { mediaId, chunkIndex, holderIds: [] } });
+  }
+  syncClock() {
+    return Promise.resolve({ clientSentAt: 1000, trackerReceivedAt: 1000,
+      trackerSentAt: 1000, clientReceivedAt: 1000 });
+  }
+  setPlayback(update) {
+    this.playbackUpdates.push(update);
+    this.playbackState = { ...update, effectiveAt: 2000 };
+    this.emit('playback', this.playbackState);
+  }
   disconnect() { this.disconnected = true; this.emit('close', {}); }
 }
 
@@ -132,4 +159,99 @@ test('room closure ends a viewer session and a cancelled request cannot reopen i
   finishConnect();
   await next;
   assert.deepEqual(controller.current, { screen: 'home' });
+});
+
+test('host playback keeps a revision for play and pause, and advances it for each seek or source', () => {
+  const playback = new HostPlaybackPublisher();
+  const paused = { paused: true, currentTime: 0, playbackRate: 1 };
+  assert.equal(playback.playbackChanged(paused), null);
+  playback.sourceSelected();
+  assert.deepEqual(playback.sourceReady(paused), {
+    playing: false, mediaTime: 0, playbackRate: 1, revision: 1,
+  });
+  assert.equal(playback.sourceReady(paused)?.revision, 1);
+  assert.deepEqual(playback.playbackChanged({ ...paused, paused: false }), {
+    playing: true, mediaTime: 0, playbackRate: 1, revision: 1,
+  });
+  assert.deepEqual(playback.seeked({ ...paused, currentTime: 40 }), {
+    playing: false, mediaTime: 40, playbackRate: 1, revision: 2,
+  });
+  playback.sourceSelected();
+  assert.equal(playback.playbackChanged(paused), null);
+  assert.equal(playback.sourceReady({ ...paused, currentTime: NaN }), null);
+  assert.equal(playback.sourceReady(paused)?.revision, 3);
+});
+
+test('host publishes playback through the tracker and viewer receives its state', async () => {
+  const host = setup();
+  await host.controller.createRoom();
+  const update = { playing: true, mediaTime: 12, playbackRate: 1, revision: 1 };
+  assert.equal(host.controller.publishPlayback(update), true);
+  assert.deepEqual(host.clients[0].playbackUpdates, [update]);
+  assert.deepEqual(host.controller.currentPlayback, { ...update, effectiveAt: 2000 });
+  host.controller.leave();
+  assert.equal(host.controller.publishPlayback(update), false);
+
+  const viewer = setup();
+  await viewer.controller.joinRoom('ABCDEFGH');
+  await Promise.resolve();
+  assert.equal(viewer.controller.currentPlayback?.revision, 0);
+  viewer.clients[0].emit('playback', { ...update, effectiveAt: 2000 });
+  assert.equal(viewer.controller.currentPlayback?.mediaTime, 12);
+  viewer.controller.leave();
+  assert.equal(viewer.controller.currentPlayback, null);
+});
+
+test('room controller shares host media and resets it when the room ends', async () => {
+  const host = setup();
+  await host.controller.createRoom();
+  const manifest = {
+    mediaId: 'media-1', durationSec: 2,
+    tracks: [{ id: 1, kind: 'video', mimeType: 'video/mp4; codecs="avc1.64000a"' }],
+    chunks: [
+      { chunkIndex: 0, trackId: 1, kind: 'init', startTimeSec: 0, endTimeSec: 0, byteLength: 10, sha256: '0'.repeat(64) },
+      { chunkIndex: 1, trackId: 1, kind: 'media', startTimeSec: 0, endTimeSec: 2, byteLength: 100, sha256: '1'.repeat(64) },
+    ],
+  };
+  await host.controller.publishMedia(manifest);
+  assert.deepEqual(host.controller.currentMedia, manifest);
+  assert.deepEqual(host.clients[0].announcedChunks, [
+    { mediaId: 'media-1', chunkIndex: 0 }, { mediaId: 'media-1', chunkIndex: 1 },
+  ]);
+  await host.controller.publishMedia(null);
+  assert.equal(host.controller.currentMedia, null);
+  host.controller.leave();
+  await assert.rejects(host.controller.publishMedia(manifest), /Only the room host/);
+
+  const viewer = setup();
+  await viewer.controller.joinRoom('ABCDEFGH');
+  viewer.clients[0].emit('media', manifest);
+  assert.deepEqual(viewer.controller.currentMedia, manifest);
+  viewer.controller.leave();
+  assert.equal(viewer.controller.currentMedia, null);
+});
+
+test('a superseded media publication does not announce old chunks', async () => {
+  const { controller, clients } = setup();
+  await controller.createRoom();
+  const manifest = {
+    mediaId: 'old-media', durationSec: 2,
+    tracks: [{ id: 1, kind: 'video', mimeType: 'video/mp4; codecs="avc1.64000a"' }],
+    chunks: [
+      { chunkIndex: 0, trackId: 1, kind: 'init', startTimeSec: 0, endTimeSec: 0,
+        byteLength: 10, sha256: '0'.repeat(64) },
+      { chunkIndex: 1, trackId: 1, kind: 'media', startTimeSec: 0, endTimeSec: 2,
+        byteLength: 10, sha256: '1'.repeat(64) },
+    ],
+  };
+  let finishOld;
+  clients[0].setMedia = (value) => value
+    ? new Promise((resolve) => { finishOld = resolve; })
+    : Promise.resolve({ payload: { mediaId: null } });
+  const oldPublication = controller.publishMedia(manifest);
+  await controller.publishMedia(null);
+  finishOld({ payload: { mediaId: 'old-media' } });
+  await oldPublication;
+  assert.deepEqual(clients[0].announcedChunks, []);
+  controller.leave();
 });

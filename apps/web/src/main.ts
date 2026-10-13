@@ -1,6 +1,10 @@
 import { TrackerClient } from '@peer-watchalong/tracker-client';
 import { RoomController, type RoomView } from './room-controller.ts';
 import { displayRoomCode } from './room-code.ts';
+import { HostPlaybackPublisher } from './host-playback.ts';
+import { createMediaManifest, prepareMp4 } from './mp4-segments.ts';
+import { ViewerPlayer } from './viewer-player.ts';
+import { randomUuid } from './random-id.ts';
 import './style.css';
 
 const app = document.querySelector<HTMLDivElement>('#app');
@@ -9,11 +13,36 @@ if (!app) throw new Error('App root was not found');
 const trackerUrl = import.meta.env.VITE_TRACKER_URL ||
   `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.hostname}:8080`;
 const controller = new RoomController(() => new TrackerClient(trackerUrl));
+let hostVideoUrl: string | null = null;
+let hostVideoElement: HTMLVideoElement | null = null;
+let hostPlayback = new HostPlaybackPublisher();
+let mediaPreparation: AbortController | null = null;
+let viewerPlayer: ViewerPlayer | null = null;
+let viewerMediaId: string | null = null;
+let viewerSyncTimer: ReturnType<typeof setInterval> | null = null;
 
 controller.subscribe((state) => {
+  clearViewerPlayer();
+  if (state.screen !== 'room' || state.role !== 'host') {
+    clearHostVideo();
+    hostPlayback = new HostPlaybackPublisher();
+  }
   app.innerHTML = page(state);
   bindActions(state);
+  syncViewerPlayer();
+  renderPlaybackStatus();
+  renderMediaStatus();
+  renderChunkProgress();
+  renderPeerStatus();
 });
+controller.subscribePlayback(renderPlaybackStatus);
+controller.subscribeMedia(() => {
+  syncViewerPlayer();
+  renderMediaStatus();
+});
+controller.subscribeChunkProgress(renderChunkProgress);
+controller.subscribePeerCount(renderPeerStatus);
+controller.subscribeVerifiedChunks((chunkIndex, data) => viewerPlayer?.receiveChunk(chunkIndex, data));
 
 function page(state: RoomView): string {
   return `
@@ -103,20 +132,29 @@ function room(state: Extract<RoomView, { screen: 'room' }>): string {
         <button class="button button-secondary" id="retry" type="button">Try again</button>
       </div>
     ` : ''}
-    <section class="player-shell" aria-label="Video player">
-      <div class="player-grid" aria-hidden="true"></div>
-      <div class="player-content">
-        <div class="player-emblem" aria-hidden="true">${iconPlay()}</div>
-        <h2>${isHost ? 'Ready when you are.' : 'Waiting for the host.'}</h2>
-        <p>${isHost ? 'Your room is open. Anyone with the code can join.' : 'The video will appear here when the host starts watching.'}</p>
+    ${isHost ? `
+      <div class="media-toolbar">
+        <input id="video-file" class="visually-hidden" type="file" accept="video/mp4,.mp4" />
+        <label class="button button-secondary" for="video-file">Choose video</label>
+        <span id="video-name">No video selected</span>
+        <span id="video-feedback" role="alert"></span>
       </div>
-      <div class="player-corner player-corner-top">${isHost ? 'HOST VIEW' : 'VIEWER VIEW'}</div>
-      <div class="player-corner player-corner-bottom">PEER WATCHALONG / ROOM ${displayRoomCode(state.code)}</div>
+    ` : ''}
+    <section class="player-shell" aria-label="Video player">
+      ${isHost ? '<video id="host-video" class="host-video" controls playsinline hidden></video>' : ''}
+      ${isHost ? '' : '<video id="viewer-video" class="host-video" playsinline hidden></video><button class="button button-primary viewer-play-button" id="viewer-play" type="button" hidden>Start watching</button><div id="viewer-feedback" class="viewer-feedback" role="alert" hidden></div>'}
+      <div id="player-placeholder" class="player-content">
+        <div class="player-emblem" aria-hidden="true">${iconPlay()}</div>
+        <h2 id="player-heading">${isHost ? 'Choose a video to play.' : 'Waiting for video.'}</h2>
+        <p id="player-description">${isHost ? 'Select a file from your device using the button above.' : 'The host has not selected a video yet.'}</p>
+      </div>
     </section>
     <div class="room-status" role="status">
       <span><span class="status-dot ${state.connection === 'connected' ? '' : 'status-dot-off'}"></span>
         ${state.connection === 'connected' ? 'Connected to room' : 'Disconnected'}</span>
-      <span>${isHost ? 'You control this room' : 'Following the host'}</span>
+      <span id="peer-status"></span>
+      ${isHost ? '' : '<span id="chunk-status"></span>'}
+      <span id="playback-status"></span>
     </div>
   `;
 }
@@ -155,6 +193,240 @@ function bindActions(state: RoomView): void {
     document.querySelector('#copy-code')?.addEventListener('click', () => {
       void copyCode(state.code);
     });
+    if (state.role === 'host') bindHostVideo();
+    else bindViewerVideo();
+  }
+}
+
+function bindViewerVideo(): void {
+  document.querySelector('#viewer-play')?.addEventListener('click', () => {
+    void viewerPlayer?.startWatching();
+  });
+  document.querySelector('#viewer-video')?.addEventListener('playing', () => {
+    const button = document.querySelector<HTMLElement>('#viewer-play');
+    if (button) button.hidden = true;
+  });
+}
+
+function syncViewerPlayer(): void {
+  const room = controller.current;
+  const manifest = controller.currentMedia;
+  if (room.screen !== 'room' || room.role !== 'viewer' || !manifest) {
+    clearViewerPlayer();
+    return;
+  }
+  if (viewerPlayer && viewerMediaId === manifest.mediaId) return;
+  clearViewerPlayer();
+  const video = document.querySelector<HTMLVideoElement>('#viewer-video');
+  if (!video) return;
+  const feedback = document.querySelector<HTMLElement>('#viewer-feedback');
+  try {
+    const player = new ViewerPlayer(video, manifest, {
+      onBuffered: syncViewerPlayback,
+      onBlocked: () => {
+        const button = document.querySelector<HTMLElement>('#viewer-play');
+        if (button) button.hidden = false;
+      },
+      onError: (error) => {
+        if (feedback) {
+          feedback.textContent = error.message;
+          feedback.hidden = false;
+        }
+      },
+    });
+    viewerPlayer = player;
+    viewerMediaId = manifest.mediaId;
+    video.hidden = false;
+    const placeholder = document.querySelector<HTMLElement>('#player-placeholder');
+    if (placeholder) placeholder.hidden = true;
+    for (const chunk of manifest.chunks) {
+      const data = controller.readCachedChunk(chunk.chunkIndex);
+      if (data) player.receiveChunk(chunk.chunkIndex, data);
+    }
+    viewerSyncTimer = setInterval(syncViewerPlayback, 250);
+    syncViewerPlayback();
+  } catch (error) {
+    if (feedback) {
+      feedback.textContent = error instanceof Error ? error.message : String(error);
+      feedback.hidden = false;
+    }
+  }
+}
+
+function syncViewerPlayback(): void {
+  const video = document.querySelector<HTMLVideoElement>('#viewer-video');
+  if (!viewerPlayer || !video) return;
+  viewerPlayer.applyDecision(controller.evaluateViewerPlayback(video.currentTime));
+}
+
+function clearViewerPlayer(): void {
+  if (viewerSyncTimer) clearInterval(viewerSyncTimer);
+  viewerSyncTimer = null;
+  viewerPlayer?.close();
+  viewerPlayer = null;
+  viewerMediaId = null;
+  const video = document.querySelector<HTMLVideoElement>('#viewer-video');
+  if (!video) return;
+  video.hidden = true;
+  const placeholder = document.querySelector<HTMLElement>('#player-placeholder');
+  if (placeholder) placeholder.hidden = false;
+  const button = document.querySelector<HTMLElement>('#viewer-play');
+  if (button) button.hidden = true;
+  const feedback = document.querySelector<HTMLElement>('#viewer-feedback');
+  if (feedback) {
+    feedback.textContent = '';
+    feedback.hidden = true;
+  }
+}
+
+function bindHostVideo(): void {
+  const input = document.querySelector<HTMLInputElement>('#video-file');
+  const video = document.querySelector<HTMLVideoElement>('#host-video');
+  if (!input || !video) return;
+  hostVideoElement = video;
+
+  video.addEventListener('loadedmetadata', () => {
+    publishHostPlayback(hostPlayback.sourceReady(video));
+  });
+  video.addEventListener('play', () => {
+    publishHostPlayback(hostPlayback.playbackChanged(video));
+  });
+  video.addEventListener('pause', () => {
+    publishHostPlayback(hostPlayback.playbackChanged(video));
+  });
+  video.addEventListener('seeked', () => {
+    publishHostPlayback(hostPlayback.seeked(video));
+  });
+  video.addEventListener('ratechange', () => {
+    publishHostPlayback(hostPlayback.playbackChanged(video));
+  });
+  video.addEventListener('ended', () => {
+    publishHostPlayback(hostPlayback.playbackChanged(video));
+  });
+
+  video.addEventListener('error', () => {
+    const feedback = document.querySelector<HTMLElement>('#video-feedback');
+    if (feedback && hostVideoUrl && video.currentSrc === hostVideoUrl) {
+      feedback.textContent = 'This video format cannot be played in this browser.';
+    }
+  });
+  input.addEventListener('change', () => {
+    const file = input.files?.[0];
+    if (!file) return;
+    if (hostVideoUrl) {
+      publishHostPlayback(hostPlayback.playbackChanged({
+        paused: true,
+        currentTime: video.currentTime,
+        playbackRate: video.playbackRate,
+      }));
+    }
+    hostPlayback.sourceSelected();
+    clearHostVideo();
+    void controller.publishMedia(null).catch(() => {});
+    hostVideoElement = video;
+    const feedback = document.querySelector<HTMLElement>('#video-feedback');
+    if (feedback) feedback.textContent = '';
+    hostVideoUrl = URL.createObjectURL(file);
+    video.src = hostVideoUrl;
+    video.hidden = false;
+    const placeholder = document.querySelector<HTMLElement>('#player-placeholder');
+    if (placeholder) placeholder.hidden = true;
+    const name = document.querySelector<HTMLElement>('#video-name');
+    if (name) name.textContent = file.name;
+    input.value = '';
+    const preparation = new AbortController();
+    mediaPreparation = preparation;
+    if (feedback) feedback.textContent = 'Preparing MP4 segments…';
+    void prepareMp4(file, { signal: preparation.signal }).then(async (media) => {
+      if (preparation.signal.aborted || hostVideoElement !== video) return;
+      const manifest = await createMediaManifest(media, randomUuid(), preparation.signal);
+      if (preparation.signal.aborted || hostVideoElement !== video) return;
+      controller.setChunkReader(media.readChunk);
+      if (feedback) feedback.textContent = 'Sharing video details with the room…';
+      await controller.publishMedia(manifest);
+      if (preparation.signal.aborted || hostVideoElement !== video) return;
+      if (feedback) feedback.textContent = `${media.chunks.length} segments prepared.`;
+    }).catch((error: unknown) => {
+      if (preparation.signal.aborted || hostVideoElement !== video) return;
+      controller.setChunkReader(() => null);
+      if (feedback) feedback.textContent = error instanceof Error
+        ? error.message : 'Could not prepare this MP4 for sharing.';
+    });
+  });
+}
+
+function publishHostPlayback(update: ReturnType<HostPlaybackPublisher['playbackChanged']>): void {
+  if (!update) return;
+  const feedback = document.querySelector<HTMLElement>('#video-feedback');
+  if (!controller.publishPlayback(update) && feedback) {
+    feedback.textContent = 'Could not share playback status with the room.';
+  }
+}
+
+function renderPlaybackStatus(): void {
+  const status = document.querySelector<HTMLElement>('#playback-status');
+  if (!status) return;
+  const room = controller.current;
+  const playback = controller.currentPlayback;
+  if (room.screen !== 'room') return;
+  if (room.role === 'host') {
+    status.textContent = playback && playback.revision > 0
+      ? 'Playback status shared with room'
+      : 'Video plays on this device';
+  } else if (!playback || playback.revision === 0) {
+    status.textContent = 'Waiting for host playback';
+  } else {
+    status.textContent = playback.playing
+      ? 'Host is playing'
+      : `Host paused at ${formatTime(playback.mediaTime)}`;
+  }
+}
+
+function renderMediaStatus(): void {
+  const room = controller.current;
+  if (room.screen !== 'room' || room.role !== 'viewer') return;
+  const heading = document.querySelector<HTMLElement>('#player-heading');
+  const description = document.querySelector<HTMLElement>('#player-description');
+  if (heading) heading.textContent = controller.currentMedia ? 'Loading video.' : 'Waiting for video.';
+  if (description) description.textContent = controller.currentMedia
+    ? 'Downloading the parts needed for playback.'
+    : 'The host has not selected a video yet.';
+}
+
+function renderChunkProgress(): void {
+  const status = document.querySelector<HTMLElement>('#chunk-status');
+  if (!status) return;
+  const progress = controller.currentChunkProgress;
+  status.textContent = progress.total > 0
+    ? `${progress.downloaded} of ${progress.total} segments received`
+    : '';
+}
+
+function renderPeerStatus(): void {
+  const status = document.querySelector<HTMLElement>('#peer-status');
+  if (!status) return;
+  const count = controller.connectedPeerCount;
+  status.textContent = `${count} ${count === 1 ? 'peer' : 'peers'} connected`;
+}
+
+function formatTime(seconds: number): string {
+  const wholeSeconds = Math.floor(seconds);
+  return `${Math.floor(wholeSeconds / 60)}:${String(wholeSeconds % 60).padStart(2, '0')}`;
+}
+
+function clearHostVideo(): void {
+  mediaPreparation?.abort();
+  mediaPreparation = null;
+  controller.setChunkReader(() => null);
+  if (hostVideoElement) {
+    hostVideoElement.pause();
+    hostVideoElement.removeAttribute('src');
+    hostVideoElement.load();
+    hostVideoElement = null;
+  }
+  if (hostVideoUrl) {
+    URL.revokeObjectURL(hostVideoUrl);
+    hostVideoUrl = null;
   }
 }
 
