@@ -4,6 +4,9 @@ import type {
   CreateRoomRes,
   ErrorMessage,
   JoinRoomRes,
+  MediaEvent,
+  MediaGetRes,
+  MediaSetRes,
   PeerId,
   PlaybackStateEvent,
   PlaybackStateRes,
@@ -94,6 +97,7 @@ export class TrackerControlHandler {
           this.registry.announceChunk(
             message.sessionId,
             message.senderId,
+            message.payload.mediaId,
             message.payload.chunkIndex,
           );
           return [];
@@ -102,16 +106,22 @@ export class TrackerControlHandler {
           const holderIds = this.registry.getEligibleChunkHolders(
             message.sessionId,
             message.senderId,
+            message.payload.mediaId,
             message.payload.chunkIndex,
           );
           return [
             this.toConnection(connectionId, {
               ...this.responseBase('CHUNK_QUERY_RES', message),
               type: 'CHUNK_QUERY_RES',
-              payload: { chunkIndex: message.payload.chunkIndex, holderIds },
+              payload: { mediaId: message.payload.mediaId,
+                chunkIndex: message.payload.chunkIndex, holderIds },
             }),
           ];
         }
+        case 'MEDIA_SET_REQ':
+          return this.setMedia(connectionId, message);
+        case 'MEDIA_GET_REQ':
+          return this.getMedia(connectionId, message);
         case 'SIGNAL_SDP':
         case 'SIGNAL_ICE':
           return this.relaySignal(connectionId, message);
@@ -253,6 +263,47 @@ export class TrackerControlHandler {
       throw new HandlerError('PEER_NOT_FOUND', `Peer ${targetPeerId} is not connected`);
     }
     return [this.toConnection(targetConnectionId, message)];
+  }
+
+  private setMedia(
+    connectionId: ConnectionId,
+    request: Extract<ControlMessage, { type: 'MEDIA_SET_REQ' }>,
+  ): OutboundControlMessage[] {
+    this.assertBoundSender(connectionId, request.sessionId, request.senderId);
+    const manifest = this.registry.setMedia(
+      request.sessionId, request.senderId, request.payload.manifest,
+    );
+    const response: MediaSetRes = {
+      ...this.responseBase('MEDIA_SET_RES', request),
+      type: 'MEDIA_SET_RES',
+      payload: { mediaId: manifest?.mediaId ?? null },
+    };
+    const room = this.registry.getRoom(request.sessionId);
+    const events = [...(room?.peers.keys() ?? [])].flatMap((peerId) => {
+      const target = this.connectionsByPeer.get(peerId);
+      if (!target) return [];
+      const event: MediaEvent = {
+        ...this.messageBase('MEDIA_EVENT', request.sessionId),
+        type: 'MEDIA_EVENT',
+        payload: { manifest },
+      };
+      return [this.toConnection(target, event)];
+    });
+    return [this.toConnection(connectionId, response), ...events];
+  }
+
+  private getMedia(
+    connectionId: ConnectionId,
+    request: Extract<ControlMessage, { type: 'MEDIA_GET_REQ' }>,
+  ): OutboundControlMessage[] {
+    this.assertBoundSender(connectionId, request.sessionId, request.senderId);
+    const room = this.registry.getRoom(request.sessionId);
+    const response: MediaGetRes = {
+      ...this.responseBase('MEDIA_GET_RES', request),
+      type: 'MEDIA_GET_RES',
+      payload: { manifest: room?.media ?? null },
+    };
+    return [this.toConnection(connectionId, response)];
   }
 
   private handleClockSync(

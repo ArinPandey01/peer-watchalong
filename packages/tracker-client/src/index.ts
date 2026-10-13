@@ -1,1 +1,1 @@
-export * from './tracker-client';
+export * from './tracker-client.ts';

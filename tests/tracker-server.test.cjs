@@ -77,10 +77,24 @@ test('routes room, chunk, and host-disconnect messages over real WebSockets', as
   viewer.send(JSON.stringify(controlMessage('JOIN_ROOM_REQ', {}, null, 'join')));
   const viewerId = (await joinReply).payload.assignedPeerId;
 
-  host.send(JSON.stringify(controlMessage('CHUNK_HAVE_EVENT', { chunkIndex: 2 }, hostId, 'have')));
-  await waitUntil(() => registry.getEligibleChunkHolders('room', viewerId, 2).includes(hostId));
+  const manifest = {
+    mediaId: 'media-1', durationSec: 2,
+    tracks: [{ id: 1, kind: 'video', mimeType: 'video/mp4; codecs="avc1.64000a"' }],
+    chunks: [
+      { chunkIndex: 0, trackId: 1, kind: 'init', startTimeSec: 0, endTimeSec: 0, byteLength: 10, sha256: '0'.repeat(64) },
+      { chunkIndex: 1, trackId: 1, kind: 'media', startTimeSec: 0, endTimeSec: 1, byteLength: 10, sha256: '1'.repeat(64) },
+      { chunkIndex: 2, trackId: 1, kind: 'media', startTimeSec: 1, endTimeSec: 2, byteLength: 10, sha256: '2'.repeat(64) },
+    ],
+  };
+  const mediaReply = waitForMessage(host, 'MEDIA_SET_RES');
+  host.send(JSON.stringify(controlMessage('MEDIA_SET_REQ', { manifest }, hostId, 'media')));
+  await mediaReply;
+  host.send(JSON.stringify(controlMessage('CHUNK_HAVE_EVENT',
+    { mediaId: 'media-1', chunkIndex: 2 }, hostId, 'have')));
+  await waitUntil(() => registry.getEligibleChunkHolders('room', viewerId, 'media-1', 2).includes(hostId));
   const queryReply = waitForMessage(viewer, 'CHUNK_QUERY_RES');
-  viewer.send(JSON.stringify(controlMessage('CHUNK_QUERY_REQ', { chunkIndex: 2 }, viewerId, 'query')));
+  viewer.send(JSON.stringify(controlMessage('CHUNK_QUERY_REQ',
+    { mediaId: 'media-1', chunkIndex: 2 }, viewerId, 'query')));
   assert.deepEqual((await queryReply).payload.holderIds, [hostId]);
 
   const roomClosed = waitForMessage(viewer, 'ROOM_CLOSED_EVENT');

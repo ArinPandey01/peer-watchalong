@@ -10,6 +10,12 @@ import type {
   ErrorMessage,
   JoinRoomReq,
   JoinRoomRes,
+  MediaEvent,
+  MediaGetReq,
+  MediaGetRes,
+  MediaManifest,
+  MediaSetReq,
+  MediaSetRes,
   PeerId,
   PeerTopology,
   PlaybackSetReq,
@@ -35,7 +41,9 @@ type ResponseMessage =
   | JoinRoomRes
   | ChunkQueryRes
   | ClockSyncRes
-  | PlaybackStateRes;
+  | PlaybackStateRes
+  | MediaSetRes
+  | MediaGetRes;
 
 interface ResponseByType {
   CREATE_ROOM_RES: CreateRoomRes;
@@ -43,6 +51,8 @@ interface ResponseByType {
   CHUNK_QUERY_RES: ChunkQueryRes;
   CLOCK_SYNC_RES: ClockSyncRes;
   PLAYBACK_STATE_RES: PlaybackStateRes;
+  MEDIA_SET_RES: MediaSetRes;
+  MEDIA_GET_RES: MediaGetRes;
 }
 
 interface PendingRequest {
@@ -64,6 +74,7 @@ export interface TrackerClientEvents {
   roomClosed: RoomClosedEvent['payload'];
   topology: PeerTopology;
   playback: PlaybackState;
+  media: MediaEvent['payload']['manifest'];
   signalSdp: SignalSdp;
   signalIce: SignalIce;
   error: ErrorMessage;
@@ -275,22 +286,22 @@ export class TrackerClient {
     }
   }
 
-  announceChunk(chunkIndex: number): void {
+  announceChunk(mediaId: string, chunkIndex: number): void {
     const identity = this.requireIdentity();
     const event: ChunkHaveEvent = {
       ...this.peerBase('CHUNK_HAVE_EVENT', identity),
       type: 'CHUNK_HAVE_EVENT',
-      payload: { chunkIndex },
+      payload: { mediaId, chunkIndex },
     };
     this.send(event);
   }
 
-  queryChunk(chunkIndex: number): Promise<ChunkQueryRes> {
+  queryChunk(mediaId: string, chunkIndex: number): Promise<ChunkQueryRes> {
     const identity = this.requireIdentity();
     const request: ChunkQueryReq = {
       ...this.peerBase('CHUNK_QUERY_REQ', identity),
       type: 'CHUNK_QUERY_REQ',
-      payload: { chunkIndex },
+      payload: { mediaId, chunkIndex },
     };
     return this.request(request, 'CHUNK_QUERY_RES');
   }
@@ -353,6 +364,26 @@ export class TrackerClient {
     return this.request(request, 'PLAYBACK_STATE_RES');
   }
 
+  setMedia(manifest: MediaManifest | null): Promise<MediaSetRes> {
+    const identity = this.requireIdentity();
+    const request: MediaSetReq = {
+      ...this.peerBase('MEDIA_SET_REQ', identity),
+      type: 'MEDIA_SET_REQ',
+      payload: { manifest },
+    };
+    return this.request(request, 'MEDIA_SET_RES');
+  }
+
+  requestMedia(): Promise<MediaGetRes> {
+    const identity = this.requireIdentity();
+    const request: MediaGetReq = {
+      ...this.peerBase('MEDIA_GET_REQ', identity),
+      type: 'MEDIA_GET_REQ',
+      payload: {},
+    };
+    return this.request(request, 'MEDIA_GET_RES');
+  }
+
   private receive(data: unknown): void {
     if (typeof data !== 'string') {
       const error = new Error('Tracker control message must be JSON text');
@@ -392,6 +423,9 @@ export class TrackerClient {
         break;
       case 'PLAYBACK_STATE_EVENT':
         this.emit('playback', message.payload.state);
+        break;
+      case 'MEDIA_EVENT':
+        this.emit('media', message.payload.manifest);
         break;
       case 'SIGNAL_SDP':
         this.emit('signalSdp', message);

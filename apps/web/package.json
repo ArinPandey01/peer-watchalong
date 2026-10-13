@@ -1,0 +1,22 @@
+{
+  "name": "@peer-watchalong/web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "vite build",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@noble/hashes": "^2.4.0",
+    "@peer-watchalong/protocol": "workspace:*",
+    "@peer-watchalong/scheduler": "workspace:*",
+    "@peer-watchalong/tracker-client": "workspace:*",
+    "@peer-watchalong/webrtc": "workspace:*",
+    "mp4box": "^2.4.1"
+  },
+  "devDependencies": {
+    "vite": "^8.3.4"
+  }
+}
