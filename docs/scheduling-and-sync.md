@@ -11,9 +11,10 @@ Priority order:
 2. the next chunks required to start or continue playback; and
 3. later chunks in the look-ahead window.
 
-The viewer looks ahead 16 seconds by default. MP4 audio and video segments
-overlap in time, so the web app plans both tracks together rather than using
-the single-timeline `planNeededChunks` helper directly.
+The viewer looks ahead 16 seconds by default. Each media chunk carries the
+video fragment and nearby audio fragments for one video interval. The viewer
+also requests the preceding bundle on a seek because an audio fragment can
+cross a video boundary.
 
 ## Request rules
 

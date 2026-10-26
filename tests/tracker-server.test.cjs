@@ -99,9 +99,44 @@ test('routes room, chunk, and host-disconnect messages over real WebSockets', as
 
   const roomClosed = waitForMessage(viewer, 'ROOM_CLOSED_EVENT');
   const viewerClose = once(viewer, 'close');
-  host.close();
+  host.close(1000, 'Leave room');
   assert.equal((await roomClosed).payload.reason, 'HOST_DISCONNECTED');
   await viewerClose;
+});
+
+test('keeps viewers connected while the host refreshes and resumes', async (t) => {
+  const tracker = await startTrackerServer({
+    port: 0, host: '127.0.0.1', hostResumeGraceMs: 500,
+    logger: quietLogger,
+  });
+  const port = tracker.server.address().port;
+  const clients = [];
+  t.after(async () => {
+    for (const client of clients) client.terminate();
+    await tracker.close();
+  });
+
+  const host = await connect(port);
+  clients.push(host);
+  const created = waitForMessage(host, 'CREATE_ROOM_RES');
+  host.send(JSON.stringify(controlMessage('CREATE_ROOM_REQ', {}, null, 'create')));
+  const { resumeToken, assignedPeerId } = (await created).payload;
+  const viewer = await connect(port);
+  clients.push(viewer);
+  const joined = waitForMessage(viewer, 'JOIN_ROOM_RES');
+  viewer.send(JSON.stringify(controlMessage('JOIN_ROOM_REQ', {}, null, 'join')));
+  await joined;
+
+  host.close();
+  await once(host, 'close');
+  const resumedHost = await connect(port);
+  clients.push(resumedHost);
+  const resumed = waitForMessage(resumedHost, 'RESUME_HOST_RES');
+  const reconnected = waitForMessage(viewer, 'HOST_RECONNECTED_EVENT');
+  resumedHost.send(JSON.stringify(controlMessage('RESUME_HOST_REQ', { resumeToken }, null, 'resume')));
+  assert.equal((await resumed).payload.assignedPeerId, assignedPeerId);
+  assert.equal((await reconnected).payload.hostPeerId, assignedPeerId);
+  assert.equal(viewer.readyState, viewer.OPEN);
 });
 
 test('reports a bind failure to its caller', async () => {

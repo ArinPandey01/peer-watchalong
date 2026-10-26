@@ -88,6 +88,24 @@ test('times out requests and queries with bounded backoff', () => {
   assert.equal(scheduler.getPeerPerformance().get('a').recentFailures, 1);
 });
 
+test('keeps a large request active while matching fragments arrive', () => {
+  const scheduler = new ChunkRequestScheduler({ requestTimeoutMs: 100 });
+  scheduler.updatePlan(plan(7), 1, 0);
+  scheduler.onHolders(7, 1, ['a', 'b'], 0);
+  scheduler.onRequestProgress('b', 7, 1, 80);
+  assert.deepEqual(scheduler.tick(99), []);
+  scheduler.onRequestProgress('a', 7, 1, 80);
+  assert.deepEqual(scheduler.tick(160), []);
+  scheduler.onRequestProgress('a', 7, 1, 170);
+  const data = new Uint8Array(4_000_000);
+  assert.deepEqual(scheduler.onData('a', {
+    opcode: DataOpcode.PAYLOAD, requestId: 1, chunkIndex: 7, data,
+  }, 250, true), [
+    { type: 'CHUNK_RECEIVED', peerId: 'a', chunkIndex: 7, data },
+  ]);
+  assert.equal(scheduler.getPeerPerformance().get('a').latencyEmaMs, 250);
+});
+
 test('backs off once for an empty holder reply and immediately retries a send failure', () => {
   const scheduler = new ChunkRequestScheduler({ initialQueryBackoffMs: 20 });
   scheduler.updatePlan(plan(0), 1, 0);

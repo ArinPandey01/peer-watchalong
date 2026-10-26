@@ -83,3 +83,70 @@ test('rejects altered bytes and ignores data after closing', async () => {
   assert.equal(loader.readChunk(0), null);
   assert.deepEqual(announced, []);
 });
+
+test('drops expired cached bytes and verifies stable IDs in a new window', async () => {
+  const source = [Uint8Array.of(0), Uint8Array.of(1), Uint8Array.of(2)];
+  const initial = manifestFor(source);
+  const requested = [];
+  const progress = [];
+  const loader = new ViewerChunkLoader({
+    manifest: initial,
+    queryHolders: async () => ['host'],
+    requestChunk: async (peerId, chunkIndex, requestId) => {
+      requested.push({ peerId, chunkIndex, requestId });
+    },
+    announceChunk: () => {},
+    onProgress: (downloaded, total) => progress.push([downloaded, total]),
+    now: () => 1000,
+  });
+  loader.updateTarget(0, 0);
+  await drain();
+  const first = requested.find((request) => request.chunkIndex === 1);
+  await loader.receive('host', {
+    opcode: DataOpcode.PAYLOAD, requestId: first.requestId,
+    chunkIndex: 1, data: source[1],
+  });
+  assert.deepEqual(loader.readChunk(1), source[1]);
+
+  loader.updateManifest({ ...initial, totalChunks: 3,
+    chunks: [initial.chunks[0], initial.chunks[2]] });
+  assert.equal(loader.readChunk(1), null);
+  assert.deepEqual(progress.at(-1), [0, 2]);
+  const next = requested.find((request) => request.chunkIndex === 2);
+  await loader.receive('host', {
+    opcode: DataOpcode.PAYLOAD, requestId: next.requestId,
+    chunkIndex: 2, data: source[2],
+  });
+  assert.deepEqual(loader.readChunk(2), source[2]);
+  loader.close();
+});
+
+test('a seek requests the preceding audio and video bundle', async () => {
+  const chunks = [Uint8Array.of(0), Uint8Array.of(1), Uint8Array.of(2)];
+  const manifest = {
+    mediaId: 'bundled', durationSec: 20,
+    tracks: [{ id: 1, kind: 'video', mimeType: 'video/mp4; codecs="avc1.64000a"' }],
+    chunks: chunks.map((data, index) => ({
+      chunkIndex: index,
+      ...(index === 0 ? { trackId: 1, kind: 'init', startTimeSec: 0, endTimeSec: 0 } : {
+        kind: 'media', startTimeSec: (index - 1) * 10, endTimeSec: index * 10,
+        parts: [{ trackId: 1, startTimeSec: (index - 1) * 10,
+          endTimeSec: index * 10, byteLength: 1 }],
+      }),
+      byteLength: data.byteLength,
+      sha256: createHash('sha256').update(data).digest('hex'),
+    })),
+  };
+  const queried = [];
+  const loader = new ViewerChunkLoader({
+    manifest,
+    queryHolders: async (index) => { queried.push(index); return ['host']; },
+    requestChunk: async () => {},
+    announceChunk: () => {},
+    now: () => 1000,
+  });
+  loader.updateTarget(15, 1);
+  await drain();
+  assert.ok(queried.includes(1));
+  loader.close();
+});

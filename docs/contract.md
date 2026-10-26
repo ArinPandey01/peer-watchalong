@@ -51,6 +51,7 @@ Tracker to host.
   payload: {
     assignedPeerId: string;
     topology: PeerTopology; // Layer 0
+    resumeToken: string;
   };
 }
 ```
@@ -86,9 +87,14 @@ Tracker to viewer.
 }
 ```
 
-When the host disconnects, the tracker sends `ROOM_CLOSED_EVENT` to each
-remaining viewer with payload `{ reason: 'HOST_DISCONNECTED' }`. Viewers must
-stop using the closed room's peer identity and media connections.
+`CREATE_ROOM_RES` includes a private `resumeToken`. If the host disconnects
+unexpectedly, the tracker pauses playback and keeps the room for 30 seconds.
+The host may send `RESUME_HOST_REQ` with that token to reclaim its peer ID;
+the tracker responds with `RESUME_HOST_RES` and tells viewers to rebuild the
+host peer connection with `HOST_RECONNECTED_EVENT`. An explicit host departure
+or expiry of that window sends `ROOM_CLOSED_EVENT` with
+`{ reason: 'HOST_DISCONNECTED' }`. Viewers then stop using the closed room's
+peer identity and media connections.
 
 ## Topology
 
@@ -114,10 +120,19 @@ joining later sends `MEDIA_GET_REQ` with `{}` and receives `MEDIA_GET_RES` with
 
 The manifest contains a unique `mediaId`, duration in seconds, one video track
 and optionally one audio track. Each track has an ID, kind, and MP4 codec MIME
-type. Each chunk has a sequential wire index, track ID, `init` or `media` kind,
-time range, byte length, and SHA-256 digest. Initialization chunks precede media chunks. The
-tracker stores only this metadata and clears old chunk claims on a new
-manifest. Manifests are limited to 512 chunks and 48 KiB of JSON.
+type. Each chunk has a stable wire index, `init` or `media` kind, time range,
+byte length, and SHA-256 digest. Initialization chunks carry one track ID and
+precede media chunks. New media chunks carry `parts` with each track ID,
+fragment time range, and byte length. Their bytes use an 8-byte `PWCH` header
+(version 1 and part count), then one 8-byte track ID/length entry per part,
+followed by the part bytes in the listed order. A bundle has a video part and
+may have an audio part; a seek may also need the preceding bundle when an
+audio fragment crosses the video boundary.
+The host prepares a full local catalog, then publishes only a window near playback.
+Window manifests include `totalChunks` and may skip wire indices outside that window.
+The tracker stores only the current window. It retains claims for unchanged chunks
+when the window moves and clears claims for chunks that leave it. Each published
+window is limited to 512 chunks and 48 KiB of JSON.
 
 | Message | Direction | Payload |
 | --- | --- | --- |

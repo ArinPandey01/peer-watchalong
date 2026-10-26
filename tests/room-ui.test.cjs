@@ -36,7 +36,12 @@ class FakeTracker {
   }
 
   connect() { return this.connectResult; }
-  async createRoom(code) { this.created.push(code); await this.createResult(code); }
+  async createRoom(code) {
+    this.created.push(code);
+    await this.createResult(code);
+    return { payload: { resumeToken: 'test-resume-token' } };
+  }
+  async resumeHost() { return { payload: { assignedPeerId: 'host' } }; }
   async joinRoom(code) { this.joined.push(code); await this.joinResult(code); }
   requestPlaybackState() { return Promise.resolve({ payload: { state: this.playbackState } }); }
   requestMedia() { return Promise.resolve({ payload: { manifest: this.media } }); }
@@ -127,7 +132,7 @@ test('viewer validates the code and maps missing-room errors', async () => {
   assert.equal(controller.current.enteredCode, 'ABCDEFGH');
 });
 
-test('viewer can retry a lost connection, while a host connection loss ends the room', async () => {
+test('viewer can retry a lost connection, while a host connection loss preserves the room view', async () => {
   const { controller, clients } = setup();
   await controller.joinRoom('ABCDEFGH');
   clients[0].emit('close', {});
@@ -139,8 +144,44 @@ test('viewer can retry a lost connection, while a host connection loss ends the 
 
   await controller.createRoom();
   clients[2].emit('close', {});
-  assert.equal(controller.current.screen, 'ended');
-  assert.match(controller.current.reason, /room has ended/);
+  assert.equal(controller.current.screen, 'room');
+  assert.equal(controller.current.connection, 'disconnected');
+});
+
+test('restores host and viewer room identities after refresh', async () => {
+  const values = new Map();
+  const store = {
+    getItem: (key) => values.get(key) ?? null,
+    setItem: (key, value) => values.set(key, value),
+    removeItem: (key) => values.delete(key),
+  };
+  const clients = [];
+  const factory = () => {
+    const client = new FakeTracker();
+    client.resumed = [];
+    client.resumeHost = async (code, token) => { client.resumed.push({ code, token }); };
+    clients.push(client);
+    return client;
+  };
+  const host = new RoomController(factory, () => 'ABCDEFGH', store);
+  await host.createRoom();
+  const refreshedHost = new RoomController(factory, () => 'ABCDEFGH', store);
+  await refreshedHost.restoreSession();
+  assert.deepEqual(clients[1].resumed, [{ code: 'ABCDEFGH', token: 'test-resume-token' }]);
+  assert.equal(refreshedHost.current.screen, 'room');
+  assert.equal(refreshedHost.hostWasResumed, true);
+  refreshedHost.leave();
+  host.leave();
+  assert.equal(values.size, 0);
+
+  const viewer = new RoomController(factory, () => 'ABCDEFGH', store);
+  await viewer.joinRoom('ABCDEFGH');
+  const refreshedViewer = new RoomController(factory, () => 'ABCDEFGH', store);
+  await refreshedViewer.restoreSession();
+  assert.deepEqual(clients.at(-1).joined, ['ABCDEFGH']);
+  refreshedViewer.leave();
+  viewer.leave();
+  assert.equal(values.size, 0);
 });
 
 test('room closure ends a viewer session and a cancelled request cannot reopen it', async () => {
@@ -180,6 +221,12 @@ test('host playback keeps a revision for play and pause, and advances it for eac
   assert.equal(playback.playbackChanged(paused), null);
   assert.equal(playback.sourceReady({ ...paused, currentTime: NaN }), null);
   assert.equal(playback.sourceReady(paused)?.revision, 3);
+});
+
+test('host playback continues above the tracker revision after restoring media', () => {
+  const publisher = new HostPlaybackPublisher();
+  publisher.seedRevision(7);
+  assert.equal(publisher.sourceReady({ paused: true, currentTime: 18, playbackRate: 1 }).revision, 8);
 });
 
 test('host publishes playback through the tracker and viewer receives its state', async () => {
@@ -229,6 +276,32 @@ test('room controller shares host media and resets it when the room ends', async
   assert.deepEqual(viewer.controller.currentMedia, manifest);
   viewer.controller.leave();
   assert.equal(viewer.controller.currentMedia, null);
+});
+
+test('viewer accepts a new metadata window for the same video', async () => {
+  const { controller, clients } = setup();
+  await controller.joinRoom('ABCDEFGH');
+  const first = {
+    mediaId: 'media-1', durationSec: 20, totalChunks: 4,
+    tracks: [{ id: 1, kind: 'video', mimeType: 'video/mp4; codecs="avc1.64000a"' }],
+    chunks: [
+      { chunkIndex: 0, trackId: 1, kind: 'init', startTimeSec: 0, endTimeSec: 0,
+        byteLength: 1, sha256: '0'.repeat(64) },
+      { chunkIndex: 1, trackId: 1, kind: 'media', startTimeSec: 0, endTimeSec: 10,
+        byteLength: 1, sha256: '1'.repeat(64) },
+    ],
+  };
+  const updates = [];
+  controller.subscribeMedia((manifest) => updates.push(manifest));
+  clients[0].emit('media', first);
+  const second = { ...first, chunks: [first.chunks[0], {
+    ...first.chunks[1], chunkIndex: 3, startTimeSec: 10, endTimeSec: 20,
+  }] };
+  clients[0].emit('media', second);
+  assert.deepEqual(controller.currentMedia, second);
+  assert.equal(updates.at(-1), second);
+  assert.deepEqual(controller.currentChunkProgress, { downloaded: 0, total: 2 });
+  controller.leave();
 });
 
 test('a superseded media publication does not announce old chunks', async () => {

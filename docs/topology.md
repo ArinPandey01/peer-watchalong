@@ -32,4 +32,8 @@ than all room members.
 When a viewer leaves, the tracker removes its chunk claims, compacts layers if
 there is a gap, rebuilds neighbor assignments, and sends complete replacement
 topologies to affected peers. This can change a remaining viewer's layer.
-When the host disconnects, the room closes; there is no host migration.
+When the host disconnects unexpectedly, the tracker keeps the room for 30
+seconds. The host can resume with its private token and the same peer ID; peers
+rebuild their connection to it. The tracker closes the room if the host does not
+resume in time. An explicit host departure closes it immediately. There is no
+host migration.

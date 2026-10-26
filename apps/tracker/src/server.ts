@@ -8,12 +8,14 @@ import {
 export const DEFAULT_TRACKER_PORT = 8080;
 export const DEFAULT_MAX_PAYLOAD_BYTES = 64 * 1024;
 export const DEFAULT_CLOSE_GRACE_MS = 1000;
+export const HOST_RESUME_GRACE_MS = 30_000;
 
 export interface TrackerServerOptions {
   port?: number;
   host?: string;
   maxPayloadBytes?: number;
   closeGraceMs?: number;
+  hostResumeGraceMs?: number;
   handler?: TrackerControlHandler;
   createConnectionId?: () => ConnectionId;
   logger?: Pick<Console, 'info' | 'error'>;
@@ -30,14 +32,24 @@ export async function startTrackerServer(
   const port = options.port ?? DEFAULT_TRACKER_PORT;
   const maxPayload = options.maxPayloadBytes ?? DEFAULT_MAX_PAYLOAD_BYTES;
   const closeGraceMs = options.closeGraceMs ?? DEFAULT_CLOSE_GRACE_MS;
+  const hostResumeGraceMs = options.hostResumeGraceMs ?? HOST_RESUME_GRACE_MS;
   assertPort(port);
   assertMaxPayload(maxPayload);
   assertCloseGrace(closeGraceMs);
+  assertCloseGrace(hostResumeGraceMs);
 
   const handler = options.handler ?? new TrackerControlHandler();
   const createConnectionId = options.createConnectionId ?? defaultCreateConnectionId;
   const logger = options.logger ?? console;
   const sockets = new Map<ConnectionId, WebSocket>();
+  const hostExpiryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+  const closeUnboundRoomSockets = (connections: ConnectionId[]) => {
+    for (const id of connections) {
+      if (handler.getBinding(id)) continue;
+      sockets.get(id)?.close(1001, 'Host disconnected');
+    }
+  };
 
   const server = new WebSocketServer({
     port,
@@ -58,13 +70,21 @@ export async function startTrackerServer(
 
       try {
         dispatch(sockets, handler.handle(connectionId, rawDataToString(data)));
+        const binding = handler.getBinding(connectionId);
+        if (binding && !handler.isHostSuspended(binding.sessionId)) {
+          const timer = hostExpiryTimers.get(binding.sessionId);
+          if (timer) {
+            clearTimeout(timer);
+            hostExpiryTimers.delete(binding.sessionId);
+          }
+        }
       } catch (error) {
         logger.error('Unhandled tracker message error', error);
         socket.close(1011, 'Internal tracker error');
       }
     });
 
-    socket.once('close', () => {
+    socket.once('close', (_code, reason) => {
       const binding = handler.getBinding(connectionId);
       const roomConnections = binding
         ? [...sockets.keys()].filter(
@@ -74,16 +94,24 @@ export async function startTrackerServer(
 
       sockets.delete(connectionId);
       try {
-        dispatch(sockets, handler.disconnect(connectionId));
+        const explicitLeave = reason.toString() === 'Leave room';
+        dispatch(sockets, handler.disconnect(connectionId, !explicitLeave));
 
-        // A host departure closes its room and removes every room binding.
-        for (const id of roomConnections) {
-          if (id === connectionId || handler.getBinding(id)) continue;
-          const roomSocket = sockets.get(id);
-          if (roomSocket) {
-            roomSocket.close(1001, 'Host disconnected');
-          }
+        if (binding && handler.isHostSuspended(binding.sessionId)) {
+          const previous = hostExpiryTimers.get(binding.sessionId);
+          if (previous) clearTimeout(previous);
+          const timer = setTimeout(() => {
+            hostExpiryTimers.delete(binding.sessionId);
+            const affected = [...sockets.keys()].filter(
+              (id) => handler.getBinding(id)?.sessionId === binding.sessionId,
+            );
+            dispatch(sockets, handler.expireSuspendedHost(binding.sessionId));
+            closeUnboundRoomSockets(affected);
+          }, hostResumeGraceMs);
+          hostExpiryTimers.set(binding.sessionId, timer);
         }
+
+        closeUnboundRoomSockets(roomConnections);
       } catch (error) {
         logger.error('Unhandled tracker disconnect error', error);
       }
@@ -115,7 +143,11 @@ export async function startTrackerServer(
   let closing: Promise<void> | null = null;
   return {
     server,
-    close: () => closing ??= closeServer(server, sockets, closeGraceMs),
+    close: () => closing ??= (async () => {
+      for (const timer of hostExpiryTimers.values()) clearTimeout(timer);
+      hostExpiryTimers.clear();
+      await closeServer(server, sockets, closeGraceMs);
+    })(),
   };
 }
 

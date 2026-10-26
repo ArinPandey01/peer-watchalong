@@ -5,6 +5,9 @@ const UINT32_MAX = 0xffff_ffff;
 const CONTROL_MESSAGE_TYPES = new Set([
   'CREATE_ROOM_REQ',
   'CREATE_ROOM_RES',
+  'RESUME_HOST_REQ',
+  'RESUME_HOST_RES',
+  'HOST_RECONNECTED_EVENT',
   'JOIN_ROOM_REQ',
   'JOIN_ROOM_RES',
   'TOPOLOGY_UPDATE_EVENT',
@@ -40,6 +43,7 @@ const ERROR_CODES = new Set([
   'INVALID_PLAYBACK_STATE',
   'STALE_PLAYBACK_REVISION',
   'SESSION_FULL',
+  'INVALID_RESUME_TOKEN',
   'PROTOCOL_VERSION_UNSUPPORTED',
 ] as const);
 
@@ -81,6 +85,30 @@ export function validateControlMessage(value: unknown): ControlMessage {
       assertExactKeys(message, responseKeys('payload'), 'message');
       validateCreateRoomPayload(message.payload);
       break;
+
+    case 'RESUME_HOST_REQ': {
+      validateBaseMessage(message);
+      assertExactKeys(message, baseKeys('payload'), 'message');
+      const payload = assertObject(message.payload, 'message.payload');
+      assertExactKeys(payload, ['resumeToken'], 'message.payload');
+      assertIdentifier(payload.resumeToken, 'message.payload.resumeToken');
+      break;
+    }
+
+    case 'RESUME_HOST_RES':
+      validateResponseMessage(message);
+      assertExactKeys(message, responseKeys('payload'), 'message');
+      validateMembershipPayload(message.payload);
+      break;
+
+    case 'HOST_RECONNECTED_EVENT': {
+      validateBaseMessage(message);
+      assertExactKeys(message, baseKeys('payload'), 'message');
+      const payload = assertObject(message.payload, 'message.payload');
+      assertExactKeys(payload, ['hostPeerId'], 'message.payload');
+      assertIdentifier(payload.hostPeerId, 'message.payload.hostPeerId');
+      break;
+    }
 
     case 'JOIN_ROOM_RES':
       validateResponseMessage(message);
@@ -248,9 +276,17 @@ function validateCreateRoomPayload(value: unknown): void {
   const payload = assertObject(value, 'message.payload');
   assertExactKeys(
     payload,
-    ['assignedPeerId', 'topology'],
+    ['assignedPeerId', 'topology', 'resumeToken'],
     'message.payload',
   );
+  assertIdentifier(payload.assignedPeerId, 'message.payload.assignedPeerId');
+  validateTopology(payload.topology, 'message.payload.topology');
+  assertIdentifier(payload.resumeToken, 'message.payload.resumeToken');
+}
+
+function validateMembershipPayload(value: unknown): void {
+  const payload = assertObject(value, 'message.payload');
+  assertExactKeys(payload, ['assignedPeerId', 'topology'], 'message.payload');
   assertIdentifier(payload.assignedPeerId, 'message.payload.assignedPeerId');
   validateTopology(payload.topology, 'message.payload.topology');
 }
@@ -316,9 +352,12 @@ function validateManifestPayload(value: unknown, nullable: boolean): void {
 function validateManifest(value: unknown): void {
   const manifest = assertObject(value, 'message.payload.manifest');
   const root = 'message.payload.manifest';
-  assertExactKeys(manifest, ['mediaId', 'durationSec', 'tracks', 'chunks'], root);
+  assertExactKeys(manifest, ['mediaId', 'durationSec', 'tracks', 'chunks'], root, ['totalChunks']);
   assertMediaId(manifest.mediaId, `${root}.mediaId`);
   assertPositiveFiniteNumber(manifest.durationSec, `${root}.durationSec`);
+  if (manifest.totalChunks !== undefined) {
+    assertUint32(manifest.totalChunks, `${root}.totalChunks`);
+  }
   if (!Array.isArray(manifest.tracks) || manifest.tracks.length < 1 ||
       manifest.tracks.length > 2) fail(`${root}.tracks must contain one or two tracks`);
   const trackKinds = new Set<string>();
@@ -345,13 +384,16 @@ function validateManifest(value: unknown): void {
   const initialized = new Set<number>();
   const mediaTracks = new Set<number>();
   const lastEnd = new Map<number, number>();
+  let previousIndex = -1;
   for (const [index, value] of manifest.chunks.entries()) {
     const path = `${root}.chunks[${index}]`;
     const chunk = assertObject(value, path);
-    assertExactKeys(chunk,
-      ['chunkIndex', 'trackId', 'kind', 'startTimeSec', 'endTimeSec', 'byteLength', 'sha256'], path);
+    const bundled = 'parts' in chunk;
+    assertExactKeys(chunk, bundled
+      ? ['chunkIndex', 'kind', 'startTimeSec', 'endTimeSec', 'byteLength', 'sha256', 'parts']
+      : ['chunkIndex', 'trackId', 'kind', 'startTimeSec', 'endTimeSec', 'byteLength', 'sha256'], path);
     assertUint32(chunk.chunkIndex, `${path}.chunkIndex`);
-    assertUint32(chunk.trackId, `${path}.trackId`);
+    if (!bundled) assertUint32(chunk.trackId, `${path}.trackId`);
     assertStringEnum(chunk.kind, new Set(['init', 'media'] as const), `${path}.kind`);
     assertNonNegativeFiniteNumber(chunk.startTimeSec, `${path}.startTimeSec`);
     assertNonNegativeFiniteNumber(chunk.endTimeSec, `${path}.endTimeSec`);
@@ -360,25 +402,71 @@ function validateManifest(value: unknown): void {
     if (!/^[0-9a-f]{64}$/.test(chunk.sha256)) {
       fail(`${path}.sha256 must be a SHA-256 hex digest`);
     }
-    if (chunk.chunkIndex !== index || !trackIds.has(chunk.trackId) ||
+    if ((manifest.totalChunks === undefined
+          ? chunk.chunkIndex !== index
+          : chunk.chunkIndex <= previousIndex) ||
+        (manifest.totalChunks !== undefined &&
+          chunk.chunkIndex >= (manifest.totalChunks as number)) ||
+        (!bundled && !trackIds.has(chunk.trackId as number)) ||
         chunk.byteLength < 1 || chunk.byteLength > 16 * 1024 * 1024) {
       fail(`${path} has an invalid index, track, or size`);
     }
-    if (chunk.kind === 'init') {
-      if (initialized.has(chunk.trackId) || mediaTracks.size > 0 ||
+    previousIndex = chunk.chunkIndex as number;
+    if (bundled) {
+      if (chunk.kind !== 'media' || initialized.size !== trackIds.size ||
+          chunk.endTimeSec <= chunk.startTimeSec ||
+          chunk.endTimeSec > (manifest.durationSec as number) + 1 ||
+          !Array.isArray(chunk.parts) || chunk.parts.length < 1 ||
+          chunk.parts.length > trackIds.size) {
+        fail(`${path} has invalid bundled media`);
+      }
+      const partTracks = new Set<number>();
+      let bundleLength = 8 + chunk.parts.length * 8;
+      let hasVideo = false;
+      for (const [partIndex, value] of chunk.parts.entries()) {
+        const partPath = `${path}.parts[${partIndex}]`;
+        const part = assertObject(value, partPath);
+        assertExactKeys(part, ['trackId', 'startTimeSec', 'endTimeSec', 'byteLength'], partPath);
+        assertUint32(part.trackId, `${partPath}.trackId`);
+        assertNonNegativeFiniteNumber(part.startTimeSec, `${partPath}.startTimeSec`);
+        assertNonNegativeFiniteNumber(part.endTimeSec, `${partPath}.endTimeSec`);
+        assertUint32(part.byteLength, `${partPath}.byteLength`);
+        if (!trackIds.has(part.trackId) || partTracks.has(part.trackId) ||
+            part.byteLength < 1 || part.endTimeSec <= part.startTimeSec ||
+            part.endTimeSec > (manifest.durationSec as number) + 1 ||
+            part.startTimeSec < (lastEnd.get(part.trackId) ?? 0) - 0.25) {
+          fail(`${partPath} has invalid media data`);
+        }
+        partTracks.add(part.trackId as number);
+        bundleLength += part.byteLength as number;
+        lastEnd.set(part.trackId as number, part.endTimeSec as number);
+        mediaTracks.add(part.trackId as number);
+        if (manifest.tracks.some((track) => track.id === part.trackId && track.kind === 'video')) {
+          hasVideo = true;
+          if (Math.abs((part.startTimeSec as number) - (chunk.startTimeSec as number)) > 0.25 ||
+              Math.abs((part.endTimeSec as number) - (chunk.endTimeSec as number)) > 0.25) {
+            fail(`${partPath} does not match the bundle time`);
+          }
+        }
+      }
+      if (!hasVideo || bundleLength !== chunk.byteLength) {
+        fail(`${path} has invalid bundle contents`);
+      }
+    } else if (chunk.kind === 'init') {
+      if (initialized.has(chunk.trackId as number) || mediaTracks.size > 0 ||
           chunk.startTimeSec !== 0 || chunk.endTimeSec !== 0) {
         fail(`${path} has an invalid initialization segment`);
       }
-      initialized.add(chunk.trackId);
+      initialized.add(chunk.trackId as number);
     } else {
-      if (!initialized.has(chunk.trackId) ||
+      if (!initialized.has(chunk.trackId as number) ||
           chunk.endTimeSec <= chunk.startTimeSec ||
           chunk.endTimeSec > (manifest.durationSec as number) + 1 ||
-          chunk.startTimeSec < (lastEnd.get(chunk.trackId) ?? 0) - 0.25) {
+          chunk.startTimeSec < (lastEnd.get(chunk.trackId as number) ?? 0) - 0.25) {
         fail(`${path} has an invalid media time range`);
       }
-      lastEnd.set(chunk.trackId, chunk.endTimeSec as number);
-      mediaTracks.add(chunk.trackId);
+      lastEnd.set(chunk.trackId as number, chunk.endTimeSec as number);
+      mediaTracks.add(chunk.trackId as number);
     }
   }
   if (initialized.size !== trackIds.size || mediaTracks.size !== trackIds.size) {

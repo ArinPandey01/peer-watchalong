@@ -31,18 +31,22 @@ user authentication; anyone with the code can attempt to join.
 5. The viewer requests the current media manifest and playback state, then
    starts downloading the chunks needed near the host's position.
 
-The tracker rebuilds affected topologies when a viewer leaves. When the host
-disconnects, it closes the room and notifies viewers. Room state is in memory;
-a tracker restart also loses it. See [topology](topology.md) for placement and
-connection rules.
+The tracker rebuilds affected topologies when a viewer leaves. An unexpected
+host disconnect starts a 30-second resume window; an explicit departure closes
+the room immediately. Room state is in memory, so a tracker restart loses it.
+See [topology](topology.md) for placement and connection rules.
 
 ## Preparing and delivering media
 
-The host uses `mp4box` to prepare separate initialization and media segments
-for the MP4's video track and optional audio track. It publishes a manifest
-containing track codecs, segment timing and size, and a SHA-256 hash for each
-segment. The tracker stores this metadata and records which peers claim to hold
-each chunk. It never stores the chunk bytes.
+The host uses `mp4box` to prepare initialization segments for the MP4's video
+track and optional audio track. It groups nearby video and audio fragments in
+one transferable media bundle per video interval. The viewer verifies the
+bundle, then appends each track's fragment to its own Media Source buffer.
+The host publishes a moving
+manifest window containing track codecs, segment timing and size, and SHA-256
+hashes for nearby segments. The tracker stores the current window and records
+which peers claim to hold its chunks. It never stores the chunk bytes. The host
+prepares the full local file before publishing the first window.
 
 For each needed chunk, a viewer asks the tracker for holders. The tracker
 returns only connected, authorized neighbors that have announced that chunk.
@@ -53,7 +57,7 @@ announcing ownership, and serving the chunk to other authorized peers.
 
 Chunk claims are advisory. A holder may disconnect or lack a claimed chunk, so
 the viewer retries another holder or queries again after backoff. The current
-cache is in browser memory. See [the network contract](contract.md) for message
+cache keeps nearby chunks in browser memory. See [the network contract](contract.md) for message
 formats and [scheduling](scheduling-and-sync.md) for request policy.
 
 ## Following the host timeline

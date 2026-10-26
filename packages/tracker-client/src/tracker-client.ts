@@ -7,6 +7,8 @@ import type {
   ControlMessage,
   CreateRoomReq,
   CreateRoomRes,
+  ResumeHostReq,
+  ResumeHostRes,
   ErrorMessage,
   JoinRoomReq,
   JoinRoomRes,
@@ -38,6 +40,7 @@ const CONNECTING = 0;
 
 type ResponseMessage =
   | CreateRoomRes
+  | ResumeHostRes
   | JoinRoomRes
   | ChunkQueryRes
   | ClockSyncRes
@@ -47,6 +50,7 @@ type ResponseMessage =
 
 interface ResponseByType {
   CREATE_ROOM_RES: CreateRoomRes;
+  RESUME_HOST_RES: ResumeHostRes;
   JOIN_ROOM_RES: JoinRoomRes;
   CHUNK_QUERY_RES: ChunkQueryRes;
   CLOCK_SYNC_RES: ClockSyncRes;
@@ -72,6 +76,7 @@ export interface TrackerClientEvents {
   open: undefined;
   close: TrackerCloseEvent;
   roomClosed: RoomClosedEvent['payload'];
+  hostReconnected: string;
   topology: PeerTopology;
   playback: PlaybackState;
   media: MediaEvent['payload']['manifest'];
@@ -286,6 +291,25 @@ export class TrackerClient {
     }
   }
 
+  async resumeHost(sessionId: SessionId, resumeToken: string): Promise<ResumeHostRes> {
+    this.assertCanRegister();
+    this.registrationInFlight = true;
+    try {
+      const request: ResumeHostReq = {
+        ...this.base('RESUME_HOST_REQ', sessionId),
+        type: 'RESUME_HOST_REQ',
+        payload: { resumeToken },
+      };
+      const response = await this.request(request, 'RESUME_HOST_RES');
+      this.sessionId = sessionId;
+      this.peerId = response.payload.assignedPeerId;
+      this.emit('topology', response.payload.topology);
+      return response;
+    } finally {
+      this.registrationInFlight = false;
+    }
+  }
+
   announceChunk(mediaId: string, chunkIndex: number): void {
     const identity = this.requireIdentity();
     const event: ChunkHaveEvent = {
@@ -420,6 +444,9 @@ export class TrackerClient {
         this.clearIdentity();
         this.rejectPending(new Error('Tracker room closed'));
         this.emit('roomClosed', message.payload);
+        break;
+      case 'HOST_RECONNECTED_EVENT':
+        this.emit('hostReconnected', message.payload.hostPeerId);
         break;
       case 'PLAYBACK_STATE_EVENT':
         this.emit('playback', message.payload.state);
@@ -577,7 +604,12 @@ function defaultCreateWebSocket(url: string): WebSocketLike {
 }
 
 function defaultCreateMessageId(): string {
-  return globalThis.crypto.randomUUID();
+  if (globalThis.crypto.randomUUID) return globalThis.crypto.randomUUID();
+  const bytes = globalThis.crypto.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6]! & 0x0f) | 0x40;
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
 function assertPositiveInteger(value: number, name: string): void {

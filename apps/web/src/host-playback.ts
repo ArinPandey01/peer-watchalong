@@ -12,6 +12,10 @@ export class HostPlaybackPublisher {
   private revision = 0;
   private ready = false;
 
+  seedRevision(revision: number): void {
+    if (Number.isSafeInteger(revision) && revision >= 0) this.revision = revision;
+  }
+
   sourceSelected(): void {
     this.ready = false;
   }

@@ -2,9 +2,11 @@ import { TrackerClient } from '@peer-watchalong/tracker-client';
 import { RoomController, type RoomView } from './room-controller.ts';
 import { displayRoomCode } from './room-code.ts';
 import { HostPlaybackPublisher } from './host-playback.ts';
-import { createMediaManifest, prepareMp4 } from './mp4-segments.ts';
+import { createMediaWindow, hashMediaWindow, prepareMp4, type PreparedMedia } from './mp4-segments.ts';
+import type { MediaManifest } from '@peer-watchalong/protocol';
 import { ViewerPlayer } from './viewer-player.ts';
 import { randomUuid } from './random-id.ts';
+import { clearHostFile, loadHostFile, saveHostFile } from './host-file-store.ts';
 import './style.css';
 
 const app = document.querySelector<HTMLDivElement>('#app');
@@ -20,12 +22,20 @@ let mediaPreparation: AbortController | null = null;
 let viewerPlayer: ViewerPlayer | null = null;
 let viewerMediaId: string | null = null;
 let viewerSyncTimer: ReturnType<typeof setInterval> | null = null;
+let hostRestoreStarted = false;
+let restoredHostTime: number | null = null;
+let hostManifest: MediaManifest | null = null;
+let hostPreparedMedia: PreparedMedia | null = null;
+let hostHashCache = new Map<number, string>();
+let hostWindowRange: { start: number; end: number } | null = null;
+let hostWindowQueue: Promise<void> = Promise.resolve();
 
 controller.subscribe((state) => {
   clearViewerPlayer();
-  if (state.screen !== 'room' || state.role !== 'host') {
+  if (state.screen !== 'room' || state.role !== 'host' || state.connection === 'disconnected') {
     clearHostVideo();
     hostPlayback = new HostPlaybackPublisher();
+    hostRestoreStarted = false;
   }
   app.innerHTML = page(state);
   bindActions(state);
@@ -34,6 +44,11 @@ controller.subscribe((state) => {
   renderMediaStatus();
   renderChunkProgress();
   renderPeerStatus();
+  if (state.screen === 'room' && state.role === 'host' &&
+      state.connection === 'connected' && controller.hostWasResumed && !hostRestoreStarted) {
+    hostRestoreStarted = true;
+    void restoreHostFile();
+  }
 });
 controller.subscribePlayback(renderPlaybackStatus);
 controller.subscribeMedia(() => {
@@ -43,6 +58,7 @@ controller.subscribeMedia(() => {
 controller.subscribeChunkProgress(renderChunkProgress);
 controller.subscribePeerCount(renderPeerStatus);
 controller.subscribeVerifiedChunks((chunkIndex, data) => viewerPlayer?.receiveChunk(chunkIndex, data));
+void controller.restoreSession();
 
 function page(state: RoomView): string {
   return `
@@ -128,7 +144,7 @@ function room(state: Extract<RoomView, { screen: 'room' }>): string {
     </section>
     ${state.connection === 'disconnected' ? `
       <div class="notice notice-error disconnection" role="alert">
-        <span>Connection lost. The host may still be here.</span>
+        <span>${isHost ? 'Connection lost. Reconnect within 30 seconds to keep this room.' : 'Connection lost. The host may still be here.'}</span>
         <button class="button button-secondary" id="retry" type="button">Try again</button>
       </div>
     ` : ''}
@@ -186,7 +202,10 @@ function bindActions(state: RoomView): void {
   } else if (state.screen === 'ended') {
     document.querySelector('#back-home')?.addEventListener('click', () => controller.leave());
   } else {
-    document.querySelector('#leave')?.addEventListener('click', () => controller.leave());
+    document.querySelector('#leave')?.addEventListener('click', () => {
+      if (state.role === 'host') void clearHostFile().catch(() => {});
+      controller.leave();
+    });
     document.querySelector('#retry')?.addEventListener('click', () => {
       void controller.retry();
     });
@@ -215,7 +234,10 @@ function syncViewerPlayer(): void {
     clearViewerPlayer();
     return;
   }
-  if (viewerPlayer && viewerMediaId === manifest.mediaId) return;
+  if (viewerPlayer && viewerMediaId === manifest.mediaId) {
+    viewerPlayer.updateManifest(manifest);
+    return;
+  }
   clearViewerPlayer();
   const video = document.querySelector<HTMLVideoElement>('#viewer-video');
   if (!video) return;
@@ -286,6 +308,10 @@ function bindHostVideo(): void {
   hostVideoElement = video;
 
   video.addEventListener('loadedmetadata', () => {
+    if (restoredHostTime !== null) {
+      video.currentTime = Math.min(restoredHostTime, video.duration || restoredHostTime);
+      restoredHostTime = null;
+    }
     publishHostPlayback(hostPlayback.sourceReady(video));
   });
   video.addEventListener('play', () => {
@@ -303,6 +329,16 @@ function bindHostVideo(): void {
   video.addEventListener('ended', () => {
     publishHostPlayback(hostPlayback.playbackChanged(video));
   });
+  video.addEventListener('timeupdate', () => {
+    void publishHostWindow(video.currentTime).catch((error: unknown) => {
+      console.error('Could not update media window', error);
+    });
+  });
+  video.addEventListener('seeked', () => {
+    void publishHostWindow(video.currentTime).catch((error: unknown) => {
+      console.error('Could not update media window', error);
+    });
+  });
 
   video.addEventListener('error', () => {
     const feedback = document.querySelector<HTMLElement>('#video-feedback');
@@ -313,6 +349,39 @@ function bindHostVideo(): void {
   input.addEventListener('change', () => {
     const file = input.files?.[0];
     if (!file) return;
+    restoredHostTime = null;
+    void saveHostFile(file).catch(() => {
+      const feedback = document.querySelector<HTMLElement>('#video-feedback');
+      if (feedback) feedback.textContent = 'Video storage is unavailable. Select it again after refresh.';
+    });
+    selectHostFile(file, video);
+    input.value = '';
+  });
+}
+
+async function restoreHostFile(): Promise<void> {
+  const video = document.querySelector<HTMLVideoElement>('#host-video');
+  if (!video) return;
+  try {
+    const file = await loadHostFile();
+    if (controller.current.screen !== 'room' || controller.current.role !== 'host') return;
+    if (hostVideoUrl) return;
+    if (!file) {
+      await controller.publishMedia(null);
+      const feedback = document.querySelector<HTMLElement>('#video-feedback');
+      if (feedback) feedback.textContent = 'Room restored. Choose the video again to continue.';
+      return;
+    }
+    hostPlayback.seedRevision(controller.currentPlayback?.revision ?? 0);
+    restoredHostTime = controller.currentPlayback?.mediaTime ?? 0;
+    selectHostFile(file, video);
+  } catch {
+    const feedback = document.querySelector<HTMLElement>('#video-feedback');
+    if (feedback) feedback.textContent = 'Room restored. Choose the video again to continue.';
+  }
+}
+
+function selectHostFile(file: File, video: HTMLVideoElement): void {
     if (hostVideoUrl) {
       publishHostPlayback(hostPlayback.playbackChanged({
         paused: true,
@@ -321,6 +390,10 @@ function bindHostVideo(): void {
       }));
     }
     hostPlayback.sourceSelected();
+    hostManifest = null;
+    hostPreparedMedia = null;
+    hostHashCache = new Map();
+    hostWindowRange = null;
     clearHostVideo();
     void controller.publishMedia(null).catch(() => {});
     hostVideoElement = video;
@@ -333,26 +406,60 @@ function bindHostVideo(): void {
     if (placeholder) placeholder.hidden = true;
     const name = document.querySelector<HTMLElement>('#video-name');
     if (name) name.textContent = file.name;
-    input.value = '';
     const preparation = new AbortController();
     mediaPreparation = preparation;
-    if (feedback) feedback.textContent = 'Preparing MP4 segments…';
+    if (feedback) feedback.textContent = 'Preparing media chunks…';
     void prepareMp4(file, { signal: preparation.signal }).then(async (media) => {
       if (preparation.signal.aborted || hostVideoElement !== video) return;
-      const manifest = await createMediaManifest(media, randomUuid(), preparation.signal);
-      if (preparation.signal.aborted || hostVideoElement !== video) return;
       controller.setChunkReader(media.readChunk);
+      hostPreparedMedia = media;
+      hostManifest = {
+        mediaId: randomUuid(), durationSec: media.durationSec, tracks: media.tracks,
+        chunks: media.chunks.map((chunk) => ({ ...chunk, sha256: '0'.repeat(64) })),
+      };
       if (feedback) feedback.textContent = 'Sharing video details with the room…';
-      await controller.publishMedia(manifest);
+      await publishHostWindow(video.currentTime);
       if (preparation.signal.aborted || hostVideoElement !== video) return;
-      if (feedback) feedback.textContent = `${media.chunks.length} segments prepared.`;
+      if (feedback) feedback.textContent = `${media.chunks.length} chunks prepared.`;
     }).catch((error: unknown) => {
       if (preparation.signal.aborted || hostVideoElement !== video) return;
       controller.setChunkReader(() => null);
       if (feedback) feedback.textContent = error instanceof Error
         ? error.message : 'Could not prepare this MP4 for sharing.';
     });
+}
+
+function publishHostWindow(targetTimeSec: number): Promise<void> {
+  const manifest = hostManifest;
+  const media = hostPreparedMedia;
+  const hashes = hostHashCache;
+  const signal = mediaPreparation?.signal;
+  if (!manifest || !media || !Number.isFinite(targetTimeSec)) return Promise.resolve();
+  if (hostWindowRange &&
+      (hostWindowRange.start === 0 || targetTimeSec >= hostWindowRange.start + 1) &&
+      (hostWindowRange.end >= manifest.durationSec ||
+        targetTimeSec <= hostWindowRange.end - Math.min(12,
+          (hostWindowRange.end - hostWindowRange.start) / 2))) return Promise.resolve();
+  const window = createMediaWindow(manifest, targetTimeSec);
+  const videoTrackId = manifest.tracks.find((track) => track.kind === 'video')?.id;
+  const videoChunks = window.chunks.filter((chunk) =>
+    chunk.kind === 'media' && (chunk.trackId === videoTrackId ||
+      chunk.parts?.some((part) => part.trackId === videoTrackId)));
+  hostWindowRange = {
+    start: videoChunks[0]?.startTimeSec ?? 0,
+    end: videoChunks.at(-1)?.endTimeSec ?? manifest.durationSec,
+  };
+  hostWindowQueue = hostWindowQueue.catch(() => {}).then(async () => {
+    if (hostManifest !== manifest) return;
+    const published = await hashMediaWindow(media, window, hashes, signal);
+    if (hostManifest !== manifest || signal?.aborted) return;
+    await controller.publishMedia(published);
+    const current = new Set(published.chunks.map((chunk) => chunk.chunkIndex));
+    for (const chunkIndex of hashes.keys()) {
+      if (!current.has(chunkIndex)) hashes.delete(chunkIndex);
+    }
   });
+  return hostWindowQueue;
 }
 
 function publishHostPlayback(update: ReturnType<HostPlaybackPublisher['playbackChanged']>): void {
@@ -398,7 +505,7 @@ function renderChunkProgress(): void {
   if (!status) return;
   const progress = controller.currentChunkProgress;
   status.textContent = progress.total > 0
-    ? `${progress.downloaded} of ${progress.total} segments received`
+    ? `${progress.downloaded} of ${progress.total} nearby segments received`
     : '';
 }
 
@@ -417,6 +524,10 @@ function formatTime(seconds: number): string {
 function clearHostVideo(): void {
   mediaPreparation?.abort();
   mediaPreparation = null;
+  hostManifest = null;
+  hostPreparedMedia = null;
+  hostHashCache = new Map();
+  hostWindowRange = null;
   controller.setChunkReader(() => null);
   if (hostVideoElement) {
     hostVideoElement.pause();
