@@ -5,6 +5,9 @@ export type Layer = 0 | 1 | 2 | 3 | 4 | 5;
 export type ControlMessageType =
   | 'CREATE_ROOM_REQ'
   | 'CREATE_ROOM_RES'
+  | 'RESUME_HOST_REQ'
+  | 'RESUME_HOST_RES'
+  | 'HOST_RECONNECTED_EVENT'
   | 'JOIN_ROOM_REQ'
   | 'JOIN_ROOM_RES'
   | 'TOPOLOGY_UPDATE_EVENT'
@@ -68,6 +71,7 @@ export interface PlaybackUpdate {
 export interface MediaManifest {
   mediaId: string;
   durationSec: number;
+  totalChunks?: number;
   tracks: Array<{
     id: number;
     kind: 'audio' | 'video';
@@ -75,13 +79,20 @@ export interface MediaManifest {
   }>;
   chunks: Array<{
     chunkIndex: number;
-    trackId: number;
     kind: 'init' | 'media';
     startTimeSec: number;
     endTimeSec: number;
     byteLength: number;
     sha256: string;
-  }>;
+  } & ({ trackId: number; parts?: never } | {
+    trackId?: never;
+    parts: Array<{
+      trackId: number;
+      startTimeSec: number;
+      endTimeSec: number;
+      byteLength: number;
+    }>;
+  })>;
 }
 
 export interface CreateRoomReq extends BaseControlMessage {
@@ -94,7 +105,23 @@ export interface CreateRoomRes extends ResponseControlMessage {
   payload: {
     assignedPeerId: PeerId;
     topology: PeerTopology;
+    resumeToken: string;
   };
+}
+
+export interface ResumeHostReq extends BaseControlMessage {
+  type: 'RESUME_HOST_REQ';
+  payload: { resumeToken: string };
+}
+
+export interface ResumeHostRes extends ResponseControlMessage {
+  type: 'RESUME_HOST_RES';
+  payload: { assignedPeerId: PeerId; topology: PeerTopology };
+}
+
+export interface HostReconnectedEvent extends BaseControlMessage {
+  type: 'HOST_RECONNECTED_EVENT';
+  payload: { hostPeerId: PeerId };
 }
 
 export interface JoinRoomReq extends BaseControlMessage {
@@ -254,6 +281,7 @@ export interface ErrorMessage extends BaseControlMessage {
       | 'INVALID_PLAYBACK_STATE'
       | 'STALE_PLAYBACK_REVISION'
       | 'SESSION_FULL'
+      | 'INVALID_RESUME_TOKEN'
       | 'PROTOCOL_VERSION_UNSUPPORTED';
     message: string;
   };
@@ -262,6 +290,9 @@ export interface ErrorMessage extends BaseControlMessage {
 export type ControlMessage =
   | CreateRoomReq
   | CreateRoomRes
+  | ResumeHostReq
+  | ResumeHostRes
+  | HostReconnectedEvent
   | JoinRoomReq
   | JoinRoomRes
   | TopologyUpdateEvent

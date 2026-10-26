@@ -27,6 +27,7 @@ test('serves a large chunk in bounded packets and reassembles it for the request
   const chunk = Uint8Array.from({ length: 40_000 }, (_, index) => index % 251);
   const packets = [];
   const results = [];
+  const fragments = [];
   let host;
   let viewer;
   host = new ChunkExchange({
@@ -41,11 +42,16 @@ test('serves a large chunk in bounded packets and reassembles it for the request
     readChunk: () => null,
     send: (_peerId, packet) => host.receive('viewer', packet),
     onResult: (peerId, result) => results.push({ peerId, result }),
+    onFragment: (peerId, chunkIndex, requestId) =>
+      fragments.push({ peerId, chunkIndex, requestId }),
   });
 
   await viewer.request('host', 4, 7);
   assert.ok(packets.length > 1);
   assert.ok(packets.every((packet) => packet.byteLength <= 16 * 1024));
+  assert.equal(fragments.length, packets.length);
+  assert.ok(fragments.every(({ peerId, chunkIndex, requestId }) =>
+    peerId === 'host' && chunkIndex === 4 && requestId === 7));
   assert.deepEqual(results, [{
     peerId: 'host',
     result: { opcode: DataOpcode.PAYLOAD, requestId: 7, chunkIndex: 4, data: chunk },

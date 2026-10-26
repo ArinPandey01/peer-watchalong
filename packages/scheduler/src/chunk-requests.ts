@@ -19,7 +19,12 @@ export interface ChunkRequestOptions {
 }
 
 interface PendingQuery { token: number; sentAtMs: number }
-interface PendingRequest { requestId: number; peerId: PeerId; sentAtMs: number }
+interface PendingRequest {
+  requestId: number;
+  peerId: PeerId;
+  sentAtMs: number;
+  lastActivityAtMs: number;
+}
 interface ChunkWork {
   chunkIndex: number;
   holderIds: readonly PeerId[] | null;
@@ -30,7 +35,7 @@ interface ChunkWork {
   queryFailures: number;
 }
 
-export const DEFAULT_REQUEST_TIMEOUT_MS = 3000;
+export const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
 export const DEFAULT_QUERY_TIMEOUT_MS = 3000;
 export const DEFAULT_INITIAL_QUERY_BACKOFF_MS = 500;
 export const DEFAULT_MAX_QUERY_BACKOFF_MS = 8000;
@@ -146,6 +151,14 @@ export class ChunkRequestScheduler {
     return this.pump(nowMs);
   }
 
+  onRequestProgress(peerId: PeerId, chunkIndex: number, requestId: number, nowMs: number): void {
+    assertTime(nowMs);
+    const pending = this.work.get(chunkIndex)?.request;
+    if (pending?.peerId === peerId && pending.requestId === requestId) {
+      pending.lastActivityAtMs = nowMs;
+    }
+  }
+
   markOwned(chunkIndex: number, nowMs: number): ChunkRequestAction[] {
     assertUint32(chunkIndex, 'chunkIndex');
     assertTime(nowMs);
@@ -158,7 +171,7 @@ export class ChunkRequestScheduler {
   tick(nowMs: number): ChunkRequestAction[] {
     assertTime(nowMs);
     for (const item of this.work.values()) {
-      if (item.request && nowMs - item.request.sentAtMs >= this.options.requestTimeoutMs) {
+      if (item.request && nowMs - item.request.lastActivityAtMs >= this.options.requestTimeoutMs) {
         item.tried.add(item.request.peerId);
         this.failRequest(item);
       }
@@ -189,7 +202,7 @@ export class ChunkRequestScheduler {
         if (ranked.length && requests < this.options.maxConcurrentRequests) {
           const peerId = ranked[0]!;
           const requestId = this.allocateRequestId();
-          item.request = { peerId, requestId, sentAtMs: nowMs };
+          item.request = { peerId, requestId, sentAtMs: nowMs, lastActivityAtMs: nowMs };
           this.stats(peerId).pendingRequests++;
           requests++;
           actions.push({ type: 'REQUEST_CHUNK', peerId, chunkIndex: item.chunkIndex, requestId });

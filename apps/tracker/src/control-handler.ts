@@ -11,6 +11,7 @@ import type {
   PlaybackStateEvent,
   PlaybackStateRes,
   RoomClosedEvent,
+  ResumeHostRes,
   SessionId,
   TopologyUpdateEvent,
 } from '../../../packages/protocol/control.ts';
@@ -52,6 +53,8 @@ export class TrackerControlHandler {
   private readonly registry: RoomRegistry;
   private readonly bindings = new Map<ConnectionId, ConnectionBinding>();
   private readonly connectionsByPeer = new Map<PeerId, ConnectionId>();
+  private readonly resumeTokens = new Map<SessionId, string>();
+  private readonly suspendedHosts = new Set<SessionId>();
   private readonly createMessageId: () => string;
   private readonly now: () => number;
 
@@ -90,6 +93,8 @@ export class TrackerControlHandler {
       switch (message.type) {
         case 'CREATE_ROOM_REQ':
           return this.createRoom(connectionId, message);
+        case 'RESUME_HOST_REQ':
+          return this.resumeHost(connectionId, message);
         case 'JOIN_ROOM_REQ':
           return this.joinRoom(connectionId, message);
         case 'CHUNK_HAVE_EVENT':
@@ -166,17 +171,25 @@ export class TrackerControlHandler {
     }
   }
 
-  disconnect(connectionId: ConnectionId): OutboundControlMessage[] {
+  disconnect(connectionId: ConnectionId, preserveHost = false): OutboundControlMessage[] {
     const binding = this.bindings.get(connectionId);
     if (!binding) return [];
 
     const room = this.registry.getRoom(binding.sessionId);
+    if (preserveHost && room?.hostPeerId === binding.peerId) {
+      this.registry.suspendHost(binding.sessionId);
+      this.suspendedHosts.add(binding.sessionId);
+      this.unbind(connectionId, binding.peerId);
+      return this.playbackBroadcast(binding.sessionId);
+    }
     const peerIdsBeforeRemoval = room ? [...room.peers.keys()] : [];
     const result = this.registry.removePeer(binding.sessionId, binding.peerId);
 
     this.unbind(connectionId, binding.peerId);
 
     if (result.roomClosed) {
+      this.resumeTokens.delete(binding.sessionId);
+      this.suspendedHosts.delete(binding.sessionId);
       const notifications: OutboundControlMessage[] = [];
       for (const peerId of peerIdsBeforeRemoval) {
         const peerConnectionId = this.connectionsByPeer.get(peerId);
@@ -200,12 +213,35 @@ export class TrackerControlHandler {
     return this.bindings.get(connectionId);
   }
 
+  isHostSuspended(sessionId: SessionId): boolean {
+    return this.suspendedHosts.has(sessionId);
+  }
+
+  expireSuspendedHost(sessionId: SessionId): OutboundControlMessage[] {
+    if (!this.suspendedHosts.delete(sessionId)) return [];
+    this.resumeTokens.delete(sessionId);
+    const peerIds = this.registry.closeRoom(sessionId);
+    return peerIds.flatMap((peerId) => {
+      const connectionId = this.connectionsByPeer.get(peerId);
+      if (!connectionId) return [];
+      this.unbind(connectionId, peerId);
+      const event: RoomClosedEvent = {
+        ...this.messageBase('ROOM_CLOSED_EVENT', sessionId),
+        type: 'ROOM_CLOSED_EVENT',
+        payload: { reason: 'HOST_DISCONNECTED' },
+      };
+      return [this.toConnection(connectionId, event)];
+    });
+  }
+
   private createRoom(
     connectionId: ConnectionId,
     request: Extract<ControlMessage, { type: 'CREATE_ROOM_REQ' }>,
   ): OutboundControlMessage[] {
     this.assertUnregistered(connectionId);
     const { peer } = this.registry.createRoom(request.sessionId);
+    const resumeToken = globalThis.crypto.randomUUID();
+    this.resumeTokens.set(request.sessionId, resumeToken);
     this.bind(connectionId, request.sessionId, peer.peerId);
 
     const response: CreateRoomRes = {
@@ -214,9 +250,62 @@ export class TrackerControlHandler {
       payload: {
         assignedPeerId: peer.peerId,
         topology: peer.topology,
+        resumeToken,
       },
     };
     return [this.toConnection(connectionId, response)];
+  }
+
+  private resumeHost(
+    connectionId: ConnectionId,
+    request: Extract<ControlMessage, { type: 'RESUME_HOST_REQ' }>,
+  ): OutboundControlMessage[] {
+    this.assertUnregistered(connectionId);
+    const room = this.registry.getRoom(request.sessionId);
+    if (!room) throw new RoomRegistryError('SESSION_NOT_FOUND', 'Room no longer exists');
+    if (!this.suspendedHosts.has(request.sessionId) ||
+        this.resumeTokens.get(request.sessionId) !== request.payload.resumeToken) {
+      throw new HandlerError('INVALID_RESUME_TOKEN', 'Host cannot resume this room');
+    }
+    this.suspendedHosts.delete(request.sessionId);
+    this.bind(connectionId, request.sessionId, room.hostPeerId);
+    const peer = room.peers.get(room.hostPeerId)!;
+    const response: ResumeHostRes = {
+      ...this.responseBase('RESUME_HOST_RES', request),
+      type: 'RESUME_HOST_RES',
+      payload: { assignedPeerId: peer.peerId, topology: peer.topology },
+    };
+    return [this.toConnection(connectionId, response), ...this.hostReconnected(request.sessionId)];
+  }
+
+  private hostReconnected(sessionId: SessionId): OutboundControlMessage[] {
+    const room = this.registry.getRoom(sessionId);
+    if (!room) return [];
+    return [...room.peers.keys()].flatMap((peerId) => {
+      if (peerId === room.hostPeerId) return [];
+      const connectionId = this.connectionsByPeer.get(peerId);
+      if (!connectionId) return [];
+      return [this.toConnection(connectionId, {
+        ...this.messageBase('HOST_RECONNECTED_EVENT', sessionId),
+        type: 'HOST_RECONNECTED_EVENT',
+        payload: { hostPeerId: room.hostPeerId },
+      })];
+    });
+  }
+
+  private playbackBroadcast(sessionId: SessionId): OutboundControlMessage[] {
+    const room = this.registry.getRoom(sessionId);
+    if (!room) return [];
+    return [...room.peers.keys()].flatMap((peerId) => {
+      const connectionId = this.connectionsByPeer.get(peerId);
+      if (!connectionId) return [];
+      const event: PlaybackStateEvent = {
+        ...this.messageBase('PLAYBACK_STATE_EVENT', sessionId),
+        type: 'PLAYBACK_STATE_EVENT',
+        payload: { state: room.playback },
+      };
+      return [this.toConnection(connectionId, event)];
+    });
   }
 
   private joinRoom(
@@ -490,7 +579,8 @@ type HandlerErrorCode =
   | 'NOT_REGISTERED'
   | 'NOT_NEIGHBOR'
   | 'INVALID_CHUNK'
-  | 'INVALID_PLAYBACK_STATE';
+  | 'INVALID_PLAYBACK_STATE'
+  | 'INVALID_RESUME_TOKEN';
 
 class HandlerError extends Error {
   readonly code: HandlerErrorCode;

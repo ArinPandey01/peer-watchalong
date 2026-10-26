@@ -40,6 +40,22 @@ export class ViewerChunkLoader {
     return this.owned.get(chunkIndex) ?? null;
   }
 
+  updateManifest(manifest: MediaManifest): void {
+    if (this.closed || manifest.mediaId !== this.options.manifest.mediaId) return;
+    const previous = new Map(this.options.manifest.chunks.map((chunk) =>
+      [chunk.chunkIndex, chunk]));
+    this.options.manifest = manifest;
+    const available = new Map(manifest.chunks.map((chunk) =>
+      [chunk.chunkIndex, chunk]));
+    for (const chunkIndex of this.owned.keys()) {
+      const before = previous.get(chunkIndex);
+      const after = available.get(chunkIndex);
+      if (!before || !after || before.sha256 !== after.sha256 ||
+          before.byteLength !== after.byteLength) this.owned.delete(chunkIndex);
+    }
+    this.options.onProgress?.(this.owned.size, manifest.chunks.length);
+  }
+
   updateTarget(targetTimeSec: number, revision: number): void {
     if (this.closed) return;
     const plan = this.plan(targetTimeSec);
@@ -50,11 +66,18 @@ export class ViewerChunkLoader {
     if (!this.closed) this.dispatch(this.scheduler.tick(this.now()));
   }
 
+  receiveFragment(peerId: string, chunkIndex: number, requestId: number): void {
+    if (!this.closed) {
+      this.scheduler.onRequestProgress(peerId, chunkIndex, requestId, this.now());
+    }
+  }
+
   async receive(peerId: string, result: ChunkPayload | ChunkNotAvailable): Promise<void> {
     if (this.closed) return;
     let valid = false;
     if (result.opcode === DataOpcode.PAYLOAD) {
-      const expected = this.options.manifest.chunks[result.chunkIndex];
+      const expected = this.options.manifest.chunks.find((chunk) =>
+        chunk.chunkIndex === result.chunkIndex);
       if (expected && result.data.byteLength === expected.byteLength) {
         try {
           valid = await sha256Hex(result.data) === expected.sha256;
@@ -75,9 +98,15 @@ export class ViewerChunkLoader {
   private plan(targetTimeSec: number): PlannedChunk[] {
     const target = Math.max(0, Math.min(targetTimeSec, this.options.manifest.durationSec));
     const plan: PlannedChunk[] = [];
+    const activeBundle = this.options.manifest.chunks.find((chunk) =>
+      chunk.kind === 'media' && chunk.parts && chunk.endTimeSec > target);
+    const previousBundle = activeBundle && [...this.options.manifest.chunks].reverse().find((chunk) =>
+      chunk.kind === 'media' && chunk.parts && chunk.chunkIndex < activeBundle.chunkIndex);
     for (const chunk of this.options.manifest.chunks) {
       if (this.owned.has(chunk.chunkIndex)) continue;
       if (chunk.kind === 'init') {
+        plan.push({ chunkIndex: chunk.chunkIndex, priority: 'URGENT', secondsUntilNeeded: 0 });
+      } else if (chunk.chunkIndex === previousBundle?.chunkIndex) {
         plan.push({ chunkIndex: chunk.chunkIndex, priority: 'URGENT', secondsUntilNeeded: 0 });
       } else if (chunk.endTimeSec > target &&
           chunk.startTimeSec <= target + DEFAULT_PREFETCH_WINDOW_SEC) {

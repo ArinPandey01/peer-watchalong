@@ -30,6 +30,7 @@ export class RoomPeerNetwork {
   private readonly createPeer: (options: WebRtcPeerOptions) => PeerSession;
   private readonly peers = new Map<string, PeerSession>();
   private readonly openChannels = new Set<string>();
+  private lastTopology: TrackerClientEvents['topology'] | null = null;
   private subscriptions: Array<() => void> = [];
   private closed = false;
 
@@ -43,6 +44,16 @@ export class RoomPeerNetwork {
     if (this.closed || this.subscriptions.length > 0) return;
     this.subscriptions = [
       this.client.on('topology', (topology) => this.applyTopology(topology)),
+      this.client.on('hostReconnected', (hostPeerId) => {
+        const peer = this.peers.get(hostPeerId);
+        if (peer) {
+          peer.close();
+          this.peers.delete(hostPeerId);
+          this.openChannels.delete(hostPeerId);
+        }
+        const topology = this.lastTopology;
+        if (topology) this.applyTopology(topology);
+      }),
       this.client.on('signalSdp', (signal) => {
         const peer = this.peers.get(signal.senderId);
         if (!peer) return;
@@ -80,6 +91,7 @@ export class RoomPeerNetwork {
   }
 
   private applyTopology(topology: TrackerClientEvents['topology']): void {
+    this.lastTopology = topology;
     const self = this.client.identity?.peerId;
     if (!self || this.closed) return;
     const authorized = new Set([

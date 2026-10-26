@@ -85,3 +85,22 @@ test('connects only tracker-authorized peers and relays their signals and data',
   assert.equal(peers.get('peer-c').closed, true);
   await assert.rejects(network.send('peer-c', Uint8Array.of(3)));
 });
+
+test('rebuilds the host peer connection after host resume', () => {
+  const tracker = new FakeTracker();
+  const peers = [];
+  const network = new RoomPeerNetwork(tracker, {
+    createPeer: () => {
+      const peer = { start() {}, close() { this.closed = true; }, closed: false };
+      peers.push(peer);
+      return peer;
+    },
+  });
+  network.start();
+  tracker.emit('topology', { layer: 1, parents: ['peer-a'], children: [], siblings: [] });
+  tracker.emit('hostReconnected', 'peer-a');
+  assert.equal(peers.length, 2);
+  assert.equal(peers[0].closed, true);
+  assert.equal(peers[1].closed, false);
+  network.close();
+});

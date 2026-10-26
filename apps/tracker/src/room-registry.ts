@@ -166,8 +166,19 @@ export class RoomRegistry {
     if (peerId !== room.hostPeerId) {
       throw new RoomRegistryError('NOT_HOST', 'Only the host may select media');
     }
+    if (manifest && room.media?.mediaId === manifest.mediaId) {
+      const previous = new Map(room.media.chunks.map((chunk) => [chunk.chunkIndex, chunk]));
+      const available = new Map(manifest.chunks.map((chunk) => [chunk.chunkIndex, chunk]));
+      for (const chunkIndex of room.chunkHolders.keys()) {
+        const before = previous.get(chunkIndex);
+        const after = available.get(chunkIndex);
+        if (!before || !after || before.sha256 !== after.sha256 ||
+            before.byteLength !== after.byteLength) room.chunkHolders.delete(chunkIndex);
+      }
+    } else {
+      room.chunkHolders.clear();
+    }
     room.media = manifest ? structuredClone(manifest) : null;
-    room.chunkHolders.clear();
     return room.media;
   }
 
@@ -212,6 +223,22 @@ export class RoomRegistry {
     }
     this.rooms.delete(sessionId);
     return peerIds;
+  }
+
+  suspendHost(sessionId: SessionId): void {
+    const room = this.requireRoom(sessionId);
+    this.removeChunkClaims(room, room.hostPeerId);
+    if (room.playback.playing) {
+      const now = this.now();
+      const elapsedSec = Math.max(0, now - room.playback.effectiveAt) / 1000;
+      const mediaTime = room.playback.mediaTime + elapsedSec * room.playback.playbackRate;
+      room.playback = {
+        ...room.playback,
+        playing: false,
+        mediaTime: room.media ? Math.min(mediaTime, room.media.durationSec) : mediaTime,
+        effectiveAt: now,
+      };
+    }
   }
 
   announceChunk(
@@ -336,7 +363,8 @@ export class RoomRegistry {
   }
 
   private assertCurrentChunk(room: RoomState, mediaId: string, chunkIndex: number): void {
-    if (room.media?.mediaId !== mediaId || chunkIndex >= room.media.chunks.length) {
+    if (room.media?.mediaId !== mediaId ||
+        !room.media.chunks.some((chunk) => chunk.chunkIndex === chunkIndex)) {
       throw new RoomRegistryError('INVALID_CHUNK', 'Chunk does not belong to the current video');
     }
   }

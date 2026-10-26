@@ -49,8 +49,9 @@ flowchart LR
 
 1. The tracker creates a room, assigns peer identities and neighbors, and
    permits signaling only between authorized neighbors.
-2. The host splits its local MP4 into audio and video segments. It sends the
-   tracker a manifest containing segment times, codecs, sizes, and SHA-256
+2. The host splits its local MP4 into video intervals and bundles each video's
+   fragment with nearby audio fragments. It sends the tracker a moving manifest
+   window containing chunk times, codecs, sizes, and SHA-256
    hashes, then announces which chunks it holds.
 3. Each viewer plans downloads around the host's current position, asks the
    tracker which neighboring peers have those chunks, and transfers the bytes
@@ -140,13 +141,18 @@ but that is a design limit, not a validated performance result.
 
 Current limitations:
 
-- Rooms and chunk claims are in memory. Refreshing or disconnecting the host
-  closes the room; refreshing a viewer loses its local session and cached
-  chunks. There is no automatic session recovery.
-- Only MP4 files under 256 MB with browser-supported codecs are accepted. The
-  manifest is limited to 512 segments and 48 KB; an individual segment cannot
-  exceed 16 MB. Some longer files may hit these limits. Audio segments may
-  cover more time than video segments in the current MP4 preparation path.
+- Rooms and chunk claims are in memory. A viewer refresh rejoins the saved
+  room. A host refresh can reclaim the same room within 30 seconds using a
+  private browser session token. The host's selected file is restored from
+  browser storage when available; if storage fails, the host must select it
+  again. A viewer's cached chunks are downloaded again after refresh. An
+  explicit host departure closes the room immediately, and tracker restarts
+  still lose all rooms.
+- Only MP4 files under 256 MB with browser-supported codecs are accepted. Each
+  published metadata window is limited to 512 segments and 48 KB; an individual
+  bundle cannot exceed 16 MB. The host still segments the full file locally
+  before sharing starts, then hashes and publishes nearby chunks. Audio fragment
+  boundaries can cross video intervals, so seeking may fetch the preceding bundle.
 - Media is prepared and cached in browser memory. Buffer eviction and
   long-running memory behavior still need work.
 - The app targets LAN use. Connectivity across different networks has not been

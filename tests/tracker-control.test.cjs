@@ -75,6 +75,34 @@ test('only host sets media, late viewers retrieve it, and replacement clears old
     .message.payload.manifest, null);
 });
 
+test('window updates keep stable chunk claims and reject expired indices', () => {
+  const { handler, request, create, join } = setup();
+  const host = create().payload.assignedPeerId;
+  const viewer = join('viewer').payload.assignedPeerId;
+  const base = manifest();
+  base.totalChunks = 4;
+  base.chunks.push({ ...base.chunks[1], chunkIndex: 2, startTimeSec: 1,
+    endTimeSec: 2, sha256: '2'.repeat(64) });
+  base.chunks[1].endTimeSec = 1;
+  handler.handle('host', request('MEDIA_SET_REQ', host, { manifest: base }));
+  handler.handle('host', request('CHUNK_HAVE_EVENT', host,
+    { mediaId: 'media-1', chunkIndex: 2 }));
+
+  const next = structuredClone(base);
+  next.chunks = [next.chunks[0], next.chunks[2], {
+    ...next.chunks[2], chunkIndex: 3, startTimeSec: 2, endTimeSec: 4,
+    sha256: '3'.repeat(64),
+  }];
+  const updated = handler.handle('host', request('MEDIA_SET_REQ', host, { manifest: next }));
+  assert.equal(updated[0].message.type, 'MEDIA_SET_RES');
+  const holders = handler.handle('viewer', request('CHUNK_QUERY_REQ', viewer,
+    { mediaId: 'media-1', chunkIndex: 2 }));
+  assert.deepEqual(holders[0].message.payload.holderIds, [host]);
+  const old = handler.handle('viewer', request('CHUNK_QUERY_REQ', viewer,
+    { mediaId: 'media-1', chunkIndex: 1 }));
+  assert.equal(old[0].message.payload.code, 'INVALID_CHUNK');
+});
+
 test('rejects malformed media metadata before it reaches the room', () => {
   const { handler, request, create } = setup();
   const host = create().payload.assignedPeerId;
@@ -194,4 +222,50 @@ test('notifies viewers when the host leaves and clears their bindings', () => {
   assert.doesNotThrow(() => validateControlMessage(notices[0].message));
   assert.equal(handler.getBinding('viewer'), undefined);
   assert.deepEqual(handler.disconnect('viewer'), []);
+});
+
+test('temporarily suspends a disconnected host and only resumes with its token', () => {
+  const { handler, registry, request, create, join, setNow } = setup();
+  const created = create();
+  const hostId = created.payload.assignedPeerId;
+  const viewerId = join('viewer').payload.assignedPeerId;
+  assert.equal(typeof created.payload.resumeToken, 'string');
+  const playback = handler.handle('host', request('PLAYBACK_SET_REQ', hostId, {
+    playing: true, mediaTime: 12, playbackRate: 1, revision: 1,
+  }));
+  assert.equal(playback.some(({ message }) => message.type === 'PLAYBACK_STATE_EVENT'), true);
+
+  setNow(6000);
+  const paused = handler.disconnect('host', true);
+  assert.equal(handler.isHostSuspended('room'), true);
+  assert.equal(registry.getRoom('room').playback.playing, false);
+  assert.equal(registry.getRoom('room').playback.mediaTime, 17);
+  assert.equal(paused[0].message.type, 'PLAYBACK_STATE_EVENT');
+  const denied = handler.handle('impostor', request('RESUME_HOST_REQ', null, { resumeToken: 'wrong' }));
+  assert.equal(denied[0].message.payload.code, 'INVALID_RESUME_TOKEN');
+  assert.equal(handler.getBinding('impostor'), undefined);
+
+  const resumed = handler.handle('new-host', request('RESUME_HOST_REQ', null, {
+    resumeToken: created.payload.resumeToken,
+  }));
+  assert.equal(resumed[0].message.type, 'RESUME_HOST_RES');
+  assert.equal(resumed[0].message.payload.assignedPeerId, hostId);
+  assert.equal(resumed.some(({ connectionId, message }) =>
+    connectionId === 'viewer' && message.type === 'HOST_RECONNECTED_EVENT'), true);
+  assert.deepEqual(handler.getBinding('new-host'), { sessionId: 'room', peerId: hostId });
+  assert.equal(handler.isHostSuspended('room'), false);
+  assert.equal(handler.getBinding('viewer').peerId, viewerId);
+  assert.deepEqual(handler.expireSuspendedHost('room'), []);
+  assert.ok(registry.getRoom('room'));
+});
+
+test('expires an unresumed host and closes viewer bindings', () => {
+  const { handler, registry, create, join } = setup();
+  create();
+  join('viewer');
+  handler.disconnect('host', true);
+  const notices = handler.expireSuspendedHost('room');
+  assert.equal(notices[0].message.type, 'ROOM_CLOSED_EVENT');
+  assert.equal(registry.getRoom('room'), undefined);
+  assert.equal(handler.getBinding('viewer'), undefined);
 });

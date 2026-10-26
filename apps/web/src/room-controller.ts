@@ -19,7 +19,7 @@ import { ViewerChunkLoader } from './viewer-chunks.ts';
 type Role = 'host' | 'viewer';
 type TrackerConnection = Pick<
   TrackerClient,
-  'connect' | 'createRoom' | 'joinRoom' | 'disconnect' | 'on' |
+  'connect' | 'createRoom' | 'resumeHost' | 'joinRoom' | 'disconnect' | 'on' |
   'setPlayback' | 'requestPlaybackState' | 'identity' | 'sendSdp' | 'sendIce'
   | 'setMedia' | 'requestMedia'
   | 'announceChunk' | 'queryChunk'
@@ -27,6 +27,9 @@ type TrackerConnection = Pick<
 >;
 type PlaybackState = TrackerClientEvents['playback'];
 type PlaybackUpdate = Parameters<TrackerClient['setPlayback']>[0];
+type SessionStore = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>;
+const VIEWER_ROOM_KEY = 'peer-watchalong.viewer-room';
+const HOST_ROOM_KEY = 'peer-watchalong.host-room';
 
 export type RoomView =
   | { screen: 'home'; error?: string; enteredCode?: string }
@@ -52,6 +55,8 @@ export class RoomController {
   ) => void>();
   private readonly createClient: () => TrackerConnection;
   private readonly createCode: () => string;
+  private readonly sessionStore: SessionStore | null;
+  private resumedHost = false;
   private client: TrackerConnection | null = null;
   private subscriptions: Array<() => void> = [];
   private playback: PlaybackState | null = null;
@@ -74,9 +79,11 @@ export class RoomController {
   constructor(
     createClient: () => TrackerConnection,
     createCode: () => string = generateRoomCode,
+    sessionStore: SessionStore | null = browserSessionStore(),
   ) {
     this.createClient = createClient;
     this.createCode = createCode;
+    this.sessionStore = sessionStore;
   }
 
   get current(): RoomView {
@@ -85,6 +92,10 @@ export class RoomController {
 
   get currentPlayback(): PlaybackState | null {
     return this.playback;
+  }
+
+  get hostWasResumed(): boolean {
+    return this.resumedHost;
   }
 
   get currentMedia(): MediaManifest | null {
@@ -217,7 +228,20 @@ export class RoomController {
 
   async createRoom(): Promise<void> {
     if (this.state.screen === 'connecting') return;
+    this.clearViewerSession();
+    this.clearHostSession();
     await this.start('host', this.createCode());
+  }
+
+  async restoreSession(): Promise<void> {
+    if (this.state.screen !== 'home') return;
+    const host = this.savedHostSession();
+    if (host) {
+      await this.start('host', host.code, host.token);
+      return;
+    }
+    const code = this.savedViewerCode();
+    if (code) await this.start('viewer', code);
   }
 
   async joinRoom(enteredCode: string): Promise<void> {
@@ -231,25 +255,31 @@ export class RoomController {
       });
       return;
     }
+    this.saveViewerCode(code);
+    this.clearHostSession();
     await this.start('viewer', code);
   }
 
   async retry(): Promise<void> {
-    if (
-      this.state.screen !== 'room' ||
-      this.state.role !== 'viewer' ||
-      this.state.connection !== 'disconnected'
-    ) return;
-    await this.start('viewer', this.state.code);
+    if (this.state.screen !== 'room' || this.state.connection !== 'disconnected') return;
+    if (this.state.role === 'host') {
+      const saved = this.savedHostSession();
+      if (saved?.code === this.state.code) await this.start('host', saved.code, saved.token);
+    } else {
+      await this.start('viewer', this.state.code);
+    }
   }
 
   leave(): void {
-    this.releaseClient();
+    this.clearViewerSession();
+    this.clearHostSession();
+    this.releaseClient(true);
     this.setState({ screen: 'home' });
   }
 
-  private async start(role: Role, initialCode: string): Promise<void> {
+  private async start(role: Role, initialCode: string, resumeToken?: string): Promise<void> {
     this.releaseClient();
+    this.resumedHost = false;
     const client = this.createClient();
     this.client = client;
     const exchange = new ChunkExchange({
@@ -259,6 +289,11 @@ export class RoomController {
         if (this.client !== client) return;
         void this.viewerLoader?.receive(peerId, result);
         for (const listener of this.chunkListeners) listener(peerId, result);
+      },
+      onFragment: (peerId, chunkIndex, requestId) => {
+        if (this.client === client) {
+          this.viewerLoader?.receiveFragment(peerId, chunkIndex, requestId);
+        }
       },
       onError: (error) => {
         if (this.client === client) console.error('Chunk exchange error', error);
@@ -283,6 +318,8 @@ export class RoomController {
     this.subscriptions = [
       client.on('roomClosed', () => {
         if (this.client !== client) return;
+        this.clearViewerSession();
+        this.clearHostSession();
         this.releaseClient();
         this.setState({
           screen: 'ended',
@@ -294,20 +331,7 @@ export class RoomController {
         if (this.client !== client) return;
         if (this.state.screen !== 'room') return;
         this.releaseClient();
-        if (role === 'host') {
-          this.setState({
-            screen: 'ended',
-            code,
-            reason: 'Your connection closed, so the room has ended.',
-          });
-        } else {
-          this.setState({
-            screen: 'room',
-            role,
-            code,
-            connection: 'disconnected',
-          });
-        }
+        this.setState({ screen: 'room', role, code, connection: 'disconnected' });
       }),
       client.on('playback', (state) => {
         if (this.client === client) this.setPlaybackState(state);
@@ -322,23 +346,33 @@ export class RoomController {
       await client.connect();
       if (this.client !== client) return;
       if (role === 'host') {
-        let registered = false;
-        for (let attempt = 0; attempt < 3; attempt += 1) {
-          try {
-            await client.createRoom(code);
-            registered = true;
-            break;
-          } catch (error) {
-            if (
-              !(error instanceof TrackerRequestError) ||
-              error.code !== 'SESSION_ALREADY_EXISTS' ||
-              attempt === 2
-            ) throw error;
-            code = this.createCode();
-            this.setState({ screen: 'connecting', role, code });
+        if (resumeToken) {
+          await client.resumeHost(code, resumeToken);
+          if (this.client !== client) return;
+          this.resumedHost = true;
+          const playback = await client.requestPlaybackState();
+          if (this.client !== client) return;
+          this.setPlaybackState(playback.payload.state);
+        } else {
+          let registered = false;
+          for (let attempt = 0; attempt < 3; attempt += 1) {
+            try {
+              const response = await client.createRoom(code);
+              this.saveHostSession(code, response.payload.resumeToken);
+              registered = true;
+              break;
+            } catch (error) {
+              if (
+                !(error instanceof TrackerRequestError) ||
+                error.code !== 'SESSION_ALREADY_EXISTS' ||
+                attempt === 2
+              ) throw error;
+              code = this.createCode();
+              this.setState({ screen: 'connecting', role, code });
+            }
           }
+          if (!registered) return;
         }
-        if (!registered) return;
       } else {
         await client.joinRoom(code);
       }
@@ -374,6 +408,14 @@ export class RoomController {
       }
     } catch (error) {
       if (this.client !== client) return;
+      if (role === 'viewer' && error instanceof TrackerRequestError &&
+          (error.code === 'SESSION_NOT_FOUND' || error.code === 'SESSION_FULL')) {
+        this.clearViewerSession();
+      }
+      if (role === 'host' && resumeToken && error instanceof TrackerRequestError &&
+          (error.code === 'SESSION_NOT_FOUND' || error.code === 'INVALID_RESUME_TOKEN')) {
+        this.clearHostSession();
+      }
       this.releaseClient();
       this.setState({
         screen: 'home',
@@ -383,7 +425,7 @@ export class RoomController {
     }
   }
 
-  private releaseClient(): void {
+  private releaseClient(explicitLeave = false): void {
     const client = this.client;
     this.client = null;
     this.mediaPublishSequence++;
@@ -404,7 +446,7 @@ export class RoomController {
     this.setPeerCount(0);
     for (const unsubscribe of this.subscriptions) unsubscribe();
     this.subscriptions = [];
-    client?.disconnect();
+    client?.disconnect(1000, explicitLeave ? 'Leave room' : 'Client disconnected');
     this.setPlaybackState(null);
     this.setMedia(null);
   }
@@ -429,7 +471,14 @@ export class RoomController {
   }
 
   private setMedia(manifest: MediaManifest | null): void {
-    if (manifest?.mediaId === this.media?.mediaId) return;
+    if (manifest?.mediaId === this.media?.mediaId) {
+      if (!manifest) return;
+      this.media = manifest;
+      this.viewerLoader?.updateManifest(manifest);
+      for (const listener of this.mediaListeners) listener(manifest);
+      this.updateViewerDownloads();
+      return;
+    }
     this.media = manifest;
     this.configureViewerLoader();
     for (const listener of this.mediaListeners) listener(manifest);
@@ -481,6 +530,64 @@ export class RoomController {
   private setState(state: RoomView): void {
     this.state = state;
     for (const listener of this.listeners) listener(state);
+  }
+
+  private savedViewerCode(): string | null {
+    try {
+      const saved = this.sessionStore?.getItem(VIEWER_ROOM_KEY);
+      const code = saved ? normalizeRoomCode(saved) : null;
+      if (saved && !code) this.clearViewerSession();
+      return code;
+    } catch {
+      return null;
+    }
+  }
+
+  private saveViewerCode(code: string): void {
+    try {
+      this.sessionStore?.setItem(VIEWER_ROOM_KEY, code);
+    } catch {}
+  }
+
+  private clearViewerSession(): void {
+    try {
+      this.sessionStore?.removeItem(VIEWER_ROOM_KEY);
+    } catch {}
+  }
+
+  private savedHostSession(): { code: string; token: string } | null {
+    try {
+      const saved = this.sessionStore?.getItem(HOST_ROOM_KEY);
+      if (!saved) return null;
+      const value: unknown = JSON.parse(saved);
+      if (typeof value !== 'object' || value === null) return null;
+      const { code, token } = value as { code?: unknown; token?: unknown };
+      const normalized = typeof code === 'string' ? normalizeRoomCode(code) : null;
+      if (!normalized || typeof token !== 'string' || !token) return null;
+      return { code: normalized, token };
+    } catch {
+      return null;
+    }
+  }
+
+  private saveHostSession(code: string, token: string): void {
+    try {
+      this.sessionStore?.setItem(HOST_ROOM_KEY, JSON.stringify({ code, token }));
+    } catch {}
+  }
+
+  private clearHostSession(): void {
+    try {
+      this.sessionStore?.removeItem(HOST_ROOM_KEY);
+    } catch {}
+  }
+}
+
+function browserSessionStore(): SessionStore | null {
+  try {
+    return typeof sessionStorage === 'undefined' ? null : sessionStorage;
+  } catch {
+    return null;
   }
 }
 

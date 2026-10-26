@@ -21,6 +21,7 @@ export interface ChunkExchangeOptions {
   readChunk: (chunkIndex: number) => Uint8Array | null | Promise<Uint8Array | null>;
   send: (peerId: string, packet: Uint8Array) => Promise<void>;
   onResult: (peerId: string, result: ChunkResult) => void;
+  onFragment?: (peerId: string, chunkIndex: number, requestId: number) => void;
   onError?: (error: Error) => void;
   maxPacketBytes?: number;
   maxChunkBytes?: number;
@@ -38,11 +39,12 @@ export class ChunkExchange {
   constructor(options: ChunkExchangeOptions) {
     this.options = {
       ...options,
+      onFragment: options.onFragment ?? (() => {}),
       onError: options.onError ?? (() => {}),
       maxPacketBytes: options.maxPacketBytes ?? 16 * 1024,
       maxChunkBytes: options.maxChunkBytes ?? 16 * 1024 * 1024,
       maxPartialChunks: options.maxPartialChunks ?? 6,
-      partialTimeoutMs: options.partialTimeoutMs ?? 5_000,
+      partialTimeoutMs: options.partialTimeoutMs ?? 12_000,
       maxConcurrentServes: options.maxConcurrentServes ?? 4,
     };
     if (!Number.isSafeInteger(this.options.maxPacketBytes) ||
@@ -184,6 +186,12 @@ export class ChunkExchange {
     }
     partial.data.set(fragment.data, fragment.offset);
     partial.nextOffset += fragment.data.byteLength;
+    clearTimeout(partial.timeout);
+    partial.timeout = setTimeout(() => {
+      this.partials.delete(key);
+      this.reportError(new Error('Chunk fragment assembly timed out'));
+    }, this.options.partialTimeoutMs);
+    this.options.onFragment(peerId, fragment.chunkIndex, fragment.requestId);
     if (partial.nextOffset === partial.totalBytes) {
       clearTimeout(partial.timeout);
       this.partials.delete(key);

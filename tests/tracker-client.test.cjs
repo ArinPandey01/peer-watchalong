@@ -73,6 +73,34 @@ async function register(client, socket) {
   await registration;
 }
 
+test('generates request IDs on a LAN HTTP page without crypto.randomUUID', async () => {
+  const originalCrypto = Object.getOwnPropertyDescriptor(globalThis, 'crypto');
+  const getRandomValues = crypto.getRandomValues.bind(crypto);
+  Object.defineProperty(globalThis, 'crypto', {
+    configurable: true,
+    value: { getRandomValues },
+  });
+  try {
+    const { client, sockets } = createClient({ createMessageId: undefined });
+    const connected = client.connect();
+    sockets[0].open();
+    await connected;
+    const registration = client.joinRoom('room');
+    const request = sockets[0].sent.at(-1);
+    assert.match(request.messageId,
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    sockets[0].receive(serverMessage('JOIN_ROOM_RES', {
+      assignedPeerId: 'viewer',
+      hostPeerId: 'host',
+      topology: { layer: 1, parents: ['host'], children: [], siblings: [] },
+    }, { replyTo: request.messageId }));
+    await registration;
+    client.disconnect();
+  } finally {
+    if (originalCrypto) Object.defineProperty(globalThis, 'crypto', originalCrypto);
+  }
+});
+
 test('a close during the handshake rejects connect and allows retry', async () => {
   const { client, sockets } = createClient();
   const first = client.connect();
